@@ -1,0 +1,25 @@
+# Runtime dependencies for the Phase 1 diagnostic notebook.
+#
+# Railgun itself is NOT a pip package — clone it separately and `pip install -e .`
+# from inside the repo (see colab_diagnostic_plan.md, Cell 3).
+#   git clone <railgun_repo_url> /content/railgun
+#   cd /content/railgun && pip install -e .
+
+# MAPF environment — pin to avoid reproducibility drift (see plan, Problem 7)
+pogema
+
+# Deep learning
+torch
+torchvision
+
+# Analysis
+numpy
+pandas
+pyarrow            # parquet I/O
+scikit-learn       # logistic regression for criticality AUC
+networkx           # graph betweenness criticality metric
+tqdm
+
+# Plotting
+matplotlib
+seaborn
