@@ -1,25 +1,30 @@
-# Runtime dependencies for the Phase 1 diagnostic notebook.
+# CRAFT — Cooperative Reward-shaping And Fine-Tuning
 #
-# Railgun itself is NOT a pip package — clone it separately and `pip install -e .`
-# from inside the repo (see colab_diagnostic_plan.md, Cell 3).
-#   git clone <railgun_repo_url> /content/railgun
-#   cd /content/railgun && pip install -e .
+# RAILGUN is NOT a pip package — clone it separately:
+#   git clone <railgun_repo_url> RAILGUN
+#   cd RAILGUN && pip install -e .
 
-# MAPF environment — pin to avoid reproducibility drift (see plan, Problem 7)
-pogema
+# MAPF environment
+pogema>=1.4.0
 
 # Deep learning
-torch
+torch>=2.0
 torchvision
 
-# Analysis
-numpy
-pandas
-pyarrow            # parquet I/O
-scikit-learn       # logistic regression for criticality AUC
-networkx           # graph betweenness criticality metric
-tqdm
+# RL training
+pyyaml                 # config loading in train_rl.py
+tensorboard            # TensorBoard logging
 
-# Plotting
+# Analysis / heuristics
+numpy
+networkx               # betweenness centrality for heuristic cost
+scikit-learn
+
+# Data
+pandas
+pyarrow
+
+# Misc
+tqdm
 matplotlib
 seaborn

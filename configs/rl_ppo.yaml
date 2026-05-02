@@ -1,0 +1,53 @@
+# CRAFT PPO hyperparameters
+# Usage: python train_rl.py --config configs/rl_ppo.yaml
+
+# ── Model ───────────────────────────────────────────────────────────────────
+unet_checkpoint: null          # path to railgun_pretrained.pt; null = train from scratch
+feature_dim: 6
+action_dim: 5
+first_layer_channels: 64
+blocks_per_stage: 0            # DoubleConv (matches pretrained checkpoint)
+bilinear: true
+
+# ── Environment ─────────────────────────────────────────────────────────────
+map_source: null               # path to .map dir or file; null = random POGEMA maps
+num_agents: 4                  # curriculum: start small
+map_size: 16                   # used when map_source is null
+map_density: 0.3
+max_steps_per_episode: 128
+
+# ── PPO ─────────────────────────────────────────────────────────────────────
+learning_rate: 3.0e-5
+clip_eps: 0.2
+entropy_coef: 0.01
+value_coef: 0.5
+gae_lambda: 0.95
+gamma: 0.99
+ppo_epochs: 4
+minibatch_size: 256
+max_grad_norm: 0.5
+
+# ── Rollout ──────────────────────────────────────────────────────────────────
+rollout_steps: 512             # env steps per rollout collection
+max_iterations: 2000
+eval_interval: 50              # iterations between ISR evaluations
+eval_episodes: 20
+save_interval: 100
+
+# ── Cost shaping ─────────────────────────────────────────────────────────────
+phi_alpha: 1.0
+phi_proximity_radius: 2
+phi_w_density: 2.0
+phi_w_bottleneck: 3.0
+phi_w_conflict: 5.0
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_dir: runs
+run_name: null                 # null = auto timestamp
+
+# ── Curriculum thresholds ────────────────────────────────────────────────────
+# When ISR exceeds threshold, advance to next curriculum stage
+curriculum:
+  - {num_agents: 4,  map_size: 16, max_steps: 128, isr_threshold: 0.50}
+  - {num_agents: 8,  map_size: 16, max_steps: 192, isr_threshold: 0.50}
+  - {num_agents: 16, map_size: 32, max_steps: 256, isr_threshold: null}
