@@ -1,5 +1,6 @@
 # Documentation / planning files (kept local only)
 *.md
+docs/
 
 # Upstream Railgun repo — installed separately, see requirements.txt
 RAILGUN/
