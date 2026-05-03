@@ -103,56 +103,60 @@ def compute_heuristic_phi(
     w_density: float = W_DENSITY,
     w_bottleneck: float = W_BOTTLENECK,
     w_conflict: float = W_CONFLICT,
-) -> torch.Tensor:  # [N] float32
+) -> tuple[torch.Tensor, dict]:  # ([N] float32, component dict)
     """Compute per-agent heuristic cooperative cost.
 
-    Parameters
-    ----------
-    positions : Tensor [N, 2]
-        Current agent positions (row, col).
-    prev_positions : Tensor [N, 2]
-        Agent positions one step ago (for conflict detection).
-    betweenness_grid : Tensor [H, W]
-        Pre-computed normalised betweenness centrality map.
+    Returns
+    -------
+    costs : Tensor [N]
+        Clamped total phi cost per agent.
+    components : dict
+        Raw (pre-clamp) per-agent tensors for each signal:
+        {"density": [N], "bottleneck": [N], "conflict": [N]}
     """
     N = positions.size(0)
     device = positions.device
-    costs = torch.zeros(N, dtype=torch.float32, device=device)
 
     if N == 0:
-        return costs
+        empty = torch.zeros(N, dtype=torch.float32, device=device)
+        return empty, {"density": empty, "bottleneck": empty, "conflict": empty}
 
     pos_f = positions.float()
 
     # ── 1. Local density ────────────────────────────────────────────────────
-    # Count other agents within L-inf radius DENSITY_RADIUS
     diff = pos_f.unsqueeze(0) - pos_f.unsqueeze(1)        # [N, N, 2]
     linf = diff.abs().max(dim=-1).values                    # [N, N]
     self_mask = ~torch.eye(N, dtype=torch.bool, device=device)
     in_radius = (linf <= DENSITY_RADIUS) & self_mask
-    density = in_radius.float().sum(dim=1)                 # [N]
-    costs = costs + w_density * density
+    density_raw = in_radius.float().sum(dim=1)             # [N]
+    density_cost = w_density * density_raw
 
     # ── 2. Bottleneck score ─────────────────────────────────────────────────
     rows = positions[:, 0].clamp(0, betweenness_grid.size(0) - 1)
     cols = positions[:, 1].clamp(0, betweenness_grid.size(1) - 1)
     bc = betweenness_grid.to(device)[rows, cols]            # [N]
     above_thr = (bc > BETWEENNESS_THR).float()
-    costs = costs + w_bottleneck * above_thr * bc
+    bottleneck_cost = w_bottleneck * above_thr * bc
 
     # ── 3. Directional conflict ─────────────────────────────────────────────
-    # heading[j] = where agent j is currently moving
     heading = positions.float() - prev_positions.float()    # [N, 2]
     projected = positions.float() + heading                 # [N, 2] approx next pos
+    conflict_cost = torch.zeros(N, dtype=torch.float32, device=device)
 
     for i in range(N):
-        target = pos_f[i]                                   # [2]
-        matches = (projected - target).abs().max(dim=-1).values < 0.5  # [N]
-        matches[i] = False                                  # exclude self
+        target = pos_f[i]
+        matches = (projected - target).abs().max(dim=-1).values < 0.5
+        matches[i] = False
         if matches.any():
-            costs[i] = costs[i] + w_conflict
+            conflict_cost[i] = w_conflict
 
-    return costs.clamp(max=MAX_COST)
+    costs = (density_cost + bottleneck_cost + conflict_cost).clamp(max=MAX_COST)
+    components = {
+        "density":    density_cost,
+        "bottleneck": bottleneck_cost,
+        "conflict":   conflict_cost,
+    }
+    return costs, components
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -194,11 +198,11 @@ class HeuristicPhiAdapter:
         positions: torch.Tensor,     # [N, 2]
         prev_positions: torch.Tensor,# [N, 2]
         agent_ids: torch.Tensor,     # [N] — not used, kept for API compat
-    ) -> tuple[torch.Tensor, None]:
-        costs = compute_heuristic_phi(
+    ) -> tuple[torch.Tensor, dict]:
+        costs, components = compute_heuristic_phi(
             positions, prev_positions, self._bc_grid,
             w_density=self.w_density,
             w_bottleneck=self.w_bottleneck,
             w_conflict=self.w_conflict,
         )
-        return costs, None
+        return costs, components

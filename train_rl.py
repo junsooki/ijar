@@ -39,6 +39,7 @@ from models.unet import UNet
 # CRAFT imports
 from envs.pogema_railgun_env import POGEMARailgunEnv
 from tools.heuristic_cost import HeuristicPhiAdapter, precompute_betweenness
+from tools.audit import AuditLogger, collect_phi_stats, collect_action_stats
 
 # RAILGUN cost shaping (from RAILGUN/tools/)
 from tools.cost_shaping import apply_cost_shaping
@@ -92,6 +93,7 @@ def collect_rollout(
       rewards     [T, N]         float32
       values      [T]            float32  (shared state value)
       dones       [T]            bool
+      audit       dict           phi stats + action stats for this rollout
     """
     N = env.num_agents
 
@@ -101,6 +103,9 @@ def collect_rollout(
     rewards_list    = []
     values_list     = []
     dones_list      = []
+    phi_costs_list  = []   # audit
+    phi_comp_list   = []   # audit
+    positions_list  = []   # audit
 
     feat, _ = env.reset()
     phi_adapter.update_map(env.obstacle)
@@ -121,7 +126,7 @@ def collect_rollout(
             if prev_locs is None:
                 prev_locs = positions.clone()
 
-            phi_costs, _ = phi_adapter(feat, positions, prev_locs, agent_ids)
+            phi_costs, phi_components = phi_adapter(feat, positions, prev_locs, agent_ids)
             phi_costs_dev = phi_costs.to(device)
             positions_dev = positions.to(device)
             agent_ids_dev = agent_ids.to(device)
@@ -132,7 +137,6 @@ def collect_rollout(
             )  # [1, 5, H, W]
 
             # Per-agent action sampling
-            # Each agent reads shaped logits at its own (row, col)
             agent_logits = shaped[0, :, positions[:, 0], positions[:, 1]].T  # [N, 5]
             dist = torch.distributions.Categorical(logits=agent_logits)
             actions = dist.sample()         # [N]
@@ -152,6 +156,9 @@ def collect_rollout(
             rewards_list.append(torch.from_numpy(rewards))
             values_list.append(value.cpu().squeeze(0))
             dones_list.append(torch.tensor(done, dtype=torch.bool))
+            phi_costs_list.append(phi_costs.cpu())
+            phi_comp_list.append({k: v.cpu() for k, v in phi_components.items()})
+            positions_list.append(positions.cpu())
 
             if done:
                 feat, _ = env.reset()
@@ -160,6 +167,11 @@ def collect_rollout(
             else:
                 feat = feat_next
 
+    audit = {
+        "phi":     collect_phi_stats(phi_costs_list, phi_comp_list),
+        "actions": collect_action_stats(actions_list, positions_list),
+    }
+
     return {
         "states":    torch.stack(states_list),      # [T, 6, H, W]
         "actions":   torch.stack(actions_list),     # [T, N]
@@ -167,6 +179,7 @@ def collect_rollout(
         "rewards":   torch.stack(rewards_list),     # [T, N]
         "values":    torch.stack(values_list),      # [T]
         "dones":     torch.stack(dones_list),       # [T]
+        "audit":     audit,
     }
 
 
@@ -252,7 +265,11 @@ def ppo_update(
     total_samples = T * N
     indices = torch.randperm(total_samples)
 
-    metrics = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "n_updates": 0}
+    metrics = {
+        "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
+        "clip_frac": 0.0, "approx_kl": 0.0, "grad_norm": 0.0,
+        "n_updates": 0,
+    }
 
     for epoch in range(ppo_epochs):
         for start in range(0, total_samples, minibatch_size):
@@ -269,8 +286,6 @@ def ppo_update(
             values_pred = value_head(logits)     # [B]
 
             # Extract per-agent logits (need positions — re-read from state ch1)
-            # Channel 1 of feature encodes agent positions as agent_id values
-            # For each sample in the minibatch, the "own" agent has id = mb_ag_idx+1
             B = mb_states.size(0)
             agent_logits = torch.zeros(B, 5, device=device)
             for b in range(B):
@@ -300,19 +315,25 @@ def ppo_update(
 
             optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(
-                list(unet.parameters()) + list(value_head.parameters()),
-                max_norm=0.5,
-            )
+            params = list(unet.parameters()) + list(value_head.parameters())
+            grad_norm = nn.utils.clip_grad_norm_(params, max_norm=0.5).item()
             optimizer.step()
+
+            # Audit metrics
+            with torch.no_grad():
+                clip_frac = ((ratio - 1.0).abs() > clip_eps).float().mean().item()
+                approx_kl = (mb_old_lp - new_log_probs).mean().item()
 
             metrics["policy_loss"] += policy_loss.item()
             metrics["value_loss"]  += value_loss.item()
             metrics["entropy"]     += entropy.item()
+            metrics["clip_frac"]   += clip_frac
+            metrics["approx_kl"]   += approx_kl
+            metrics["grad_norm"]   += grad_norm
             metrics["n_updates"]   += 1
 
     n = metrics["n_updates"]
-    for k in ("policy_loss", "value_loss", "entropy"):
+    for k in ("policy_loss", "value_loss", "entropy", "clip_frac", "approx_kl", "grad_norm"):
         metrics[k] /= max(n, 1)
     return metrics
 
@@ -430,6 +451,8 @@ def main():
     log_dir = os.path.join(cfg.get("log_dir", "runs"), run_name)
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)
+    audit_interval = cfg.get("audit_interval", 10)
+    auditor = AuditLogger(log_dir, writer, print_interval=audit_interval)
     # Save config
     with open(os.path.join(log_dir, "config.yaml"), "w") as f:
         yaml.dump(cfg, f)
@@ -539,6 +562,8 @@ def main():
               f"ent={metrics['entropy']:.4f}  "
               f"({elapsed:.1f}s)")
 
+        auditor.record(iteration, rollout["audit"], metrics)
+
         # ── Evaluation ───────────────────────────────────────────────────────
         if iteration % eval_int == 0:
             isr = evaluate_isr(
@@ -584,6 +609,7 @@ def main():
         "iteration": max_iter,
     }, os.path.join(log_dir, "final.pt"))
     print(f"\nTraining complete. Best ISR: {best_isr:.3f}")
+    auditor.close()
     writer.close()
 
 
