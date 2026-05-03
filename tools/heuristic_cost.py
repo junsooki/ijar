@@ -27,7 +27,6 @@ DENSITY_RADIUS   = 3
 W_DENSITY        = 2.0
 W_BOTTLENECK     = 3.0
 W_CONFLICT       = 5.0
-BETWEENNESS_THR  = 0.8   # fraction of max; cells above this are "bottlenecks"
 MAX_COST         = 5.0   # same clamp as PhiGNN.max_cost
 
 # Cache: map_hash → betweenness_grid tensor
@@ -134,21 +133,29 @@ def compute_heuristic_phi(
     # ── 2. Bottleneck score ─────────────────────────────────────────────────
     rows = positions[:, 0].clamp(0, betweenness_grid.size(0) - 1)
     cols = positions[:, 1].clamp(0, betweenness_grid.size(1) - 1)
-    bc = betweenness_grid.to(device)[rows, cols]            # [N]
-    above_thr = (bc > BETWEENNESS_THR).float()
-    bottleneck_cost = w_bottleneck * above_thr * bc
+    bc = betweenness_grid.to(device)[rows, cols]            # [N], already normalized 0–1
+    bottleneck_cost = w_bottleneck * bc
 
     # ── 3. Directional conflict ─────────────────────────────────────────────
     heading = positions.float() - prev_positions.float()    # [N, 2]
-    projected = positions.float() + heading                 # [N, 2] approx next pos
     conflict_cost = torch.zeros(N, dtype=torch.float32, device=device)
 
+    heading_norm = heading.norm(dim=-1, keepdim=True).clamp(min=1e-6)  # [N, 1]
+    heading_unit = heading / heading_norm                               # [N, 2]
+
     for i in range(N):
-        target = pos_f[i]
-        matches = (projected - target).abs().max(dim=-1).values < 0.5
-        matches[i] = False
-        if matches.any():
-            conflict_cost[i] = w_conflict
+        for j in range(N):
+            if i == j:
+                continue
+            dir_j_to_i = pos_f[i] - pos_f[j]                          # [2]
+            dist_ji = dir_j_to_i.norm().clamp(min=1e-6)
+            dir_j_to_i_unit = dir_j_to_i / dist_ji
+            # How directly is j heading toward i?
+            alignment = (heading_unit[j] * dir_j_to_i_unit).sum().clamp(0, 1)  # scalar
+            # Proximity weight — closer agents contribute more
+            proximity = (1.0 / (dist_ji + 1.0))
+            conflict_cost[i] = conflict_cost[i] + w_conflict * alignment * proximity
+            conflict_cost[j] = conflict_cost[j] + w_conflict * alignment * proximity  # aggressor also penalized
 
     costs = (density_cost + bottleneck_cost + conflict_cost).clamp(max=MAX_COST)
     components = {

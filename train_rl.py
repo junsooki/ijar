@@ -97,15 +97,18 @@ def collect_rollout(
     """
     N = env.num_agents
 
-    states_list     = []
-    actions_list    = []
-    log_probs_list  = []
-    rewards_list    = []
-    values_list     = []
-    dones_list      = []
-    phi_costs_list  = []   # audit
-    phi_comp_list   = []   # audit
-    positions_list  = []   # audit
+    states_list        = []
+    actions_list       = []
+    log_probs_list     = []
+    rewards_list       = []
+    values_list        = []
+    dones_list         = []
+    phi_costs_list     = []   # audit
+    phi_comp_list      = []   # audit
+    positions_list     = []   # audit
+    shaped_logits_list = []   # fix1: store shaped agent logits for PPO reference
+    shaping_delta_list = []   # fix1: shaped - raw per-agent logits
+    logit_scales_list  = []   # fix2: track logit scale per step
 
     feat, _ = env.reset()
     phi_adapter.update_map(env.obstacle)
@@ -131,13 +134,25 @@ def collect_rollout(
             positions_dev = positions.to(device)
             agent_ids_dev = agent_ids.to(device)
 
+            # FIX 2: normalize phi penalty by logit scale
+            raw_agent_logits_for_scale = logits[0, :, positions[:, 0], positions[:, 1]].T  # [N, 5]
+            logit_scale = raw_agent_logits_for_scale.std().clamp(min=0.1).item()
+            effective_alpha = phi_alpha / logit_scale
+
             shaped = apply_cost_shaping(
                 logits, phi_costs_dev, feat, positions_dev, agent_ids_dev,
-                alpha=phi_alpha, proximity_radius=phi_proximity_radius,
+                alpha=effective_alpha, proximity_radius=phi_proximity_radius,
             )  # [1, 5, H, W]
 
             # Per-agent action sampling
             agent_logits = shaped[0, :, positions[:, 0], positions[:, 1]].T  # [N, 5]
+
+            # FIX 1: compute and store shaped logits and shaping delta for PPO reference
+            raw_agent_logits = logits[0, :, positions[:, 0], positions[:, 1]].T  # [N, 5]
+            shaping_delta = agent_logits - raw_agent_logits  # [N, 5] — the phi correction
+            shaped_logits_list.append(agent_logits.cpu())    # [N, 5]
+            shaping_delta_list.append(shaping_delta.cpu())   # [N, 5]
+            logit_scales_list.append(logit_scale)            # scalar
             dist = torch.distributions.Categorical(logits=agent_logits)
             actions = dist.sample()         # [N]
             log_probs = dist.log_prob(actions)  # [N]
@@ -167,19 +182,23 @@ def collect_rollout(
             else:
                 feat = feat_next
 
+    phi_stats = collect_phi_stats(phi_costs_list, phi_comp_list)
+    phi_stats["mean_logit_scale"] = float(np.mean(logit_scales_list))  # fix2: audit
     audit = {
-        "phi":     collect_phi_stats(phi_costs_list, phi_comp_list),
+        "phi":     phi_stats,
         "actions": collect_action_stats(actions_list, positions_list),
     }
 
     return {
-        "states":    torch.stack(states_list),      # [T, 6, H, W]
-        "actions":   torch.stack(actions_list),     # [T, N]
-        "log_probs": torch.stack(log_probs_list),   # [T, N]
-        "rewards":   torch.stack(rewards_list),     # [T, N]
-        "values":    torch.stack(values_list),      # [T]
-        "dones":     torch.stack(dones_list),       # [T]
-        "audit":     audit,
+        "states":              torch.stack(states_list),        # [T, 6, H, W]
+        "actions":             torch.stack(actions_list),       # [T, N]
+        "log_probs":           torch.stack(log_probs_list),     # [T, N]
+        "rewards":             torch.stack(rewards_list),       # [T, N]
+        "values":              torch.stack(values_list),        # [T]
+        "dones":               torch.stack(dones_list),         # [T]
+        "shaped_agent_logits": torch.stack(shaped_logits_list), # [T, N, 5]  fix1
+        "shaping_delta":       torch.stack(shaping_delta_list), # [T, N, 5]  fix1
+        "audit":               audit,
     }
 
 
@@ -250,12 +269,14 @@ def ppo_update(
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     # Flatten: treat each (step, agent) as an independent sample
-    flat_states    = rollout["states"].unsqueeze(1).expand(-1, N, -1, -1, -1).reshape(T * N, *rollout["states"].shape[1:])
-    flat_actions   = rollout["actions"].reshape(T * N)
-    flat_old_lp    = rollout["log_probs"].reshape(T * N)
-    flat_adv       = advantages.reshape(T * N)
-    flat_returns   = returns.reshape(T * N)
-    flat_agent_idx = torch.arange(N).repeat(T)           # which agent (0..N-1) at each sample
+    flat_states         = rollout["states"].unsqueeze(1).expand(-1, N, -1, -1, -1).reshape(T * N, *rollout["states"].shape[1:])
+    flat_actions        = rollout["actions"].reshape(T * N)
+    flat_old_lp         = rollout["log_probs"].reshape(T * N)   # kept for reference/audit
+    flat_adv            = advantages.reshape(T * N)
+    flat_returns        = returns.reshape(T * N)
+    flat_agent_idx      = torch.arange(N).repeat(T)             # which agent (0..N-1) at each sample
+    flat_old_shaped     = rollout["shaped_agent_logits"].reshape(T * N, 5)  # fix1: old shaped logits
+    flat_shaping_delta  = rollout["shaping_delta"].reshape(T * N, 5)        # fix1: phi correction
 
     # Also store positions per step — needed for cost shaping during update
     # We re-extract positions from states on-the-fly (cheaper than storing them)
@@ -274,18 +295,19 @@ def ppo_update(
     for epoch in range(ppo_epochs):
         for start in range(0, total_samples, minibatch_size):
             mb_idx = indices[start:start + minibatch_size]
-            mb_states   = flat_states[mb_idx].to(device)
-            mb_actions  = flat_actions[mb_idx].to(device)
-            mb_old_lp   = flat_old_lp[mb_idx].to(device)
-            mb_adv      = flat_adv[mb_idx].to(device)
-            mb_returns  = flat_returns[mb_idx].to(device)
-            mb_ag_idx   = flat_agent_idx[mb_idx]
+            mb_states        = flat_states[mb_idx].to(device)
+            mb_actions       = flat_actions[mb_idx].to(device)
+            mb_adv           = flat_adv[mb_idx].to(device)
+            mb_returns       = flat_returns[mb_idx].to(device)
+            mb_ag_idx        = flat_agent_idx[mb_idx]
+            mb_shaping_delta = flat_shaping_delta[mb_idx].to(device)   # fix1: [B, 5]
+            mb_old_shaped    = flat_old_shaped[mb_idx].to(device)       # fix1: [B, 5]
 
             # Forward pass
             logits, _ = unet(mb_states)          # [B, 5, H, W]
             values_pred = value_head(logits)     # [B]
 
-            # Extract per-agent logits (need positions — re-read from state ch1)
+            # Extract per-agent raw logits (need positions — re-read from state ch1)
             B = mb_states.size(0)
             agent_logits = torch.zeros(B, 5, device=device)
             for b in range(B):
@@ -298,12 +320,20 @@ def ppo_update(
                 else:
                     agent_logits[b] = logits[b].mean(dim=(-2, -1))
 
-            dist = torch.distributions.Categorical(logits=agent_logits)
+            # FIX 1: apply stored shaping delta so new logits match the same
+            # distribution family (shaped) as the old logits collected during rollout
+            shaped_agent_logits = agent_logits + mb_shaping_delta   # [B, 5]
+            dist = torch.distributions.Categorical(logits=shaped_agent_logits)
             new_log_probs = dist.log_prob(mb_actions)
             entropy = dist.entropy().mean()
 
+            # FIX 1: recompute old log-probs from stored shaped logits so that
+            # both old and new come from the same distribution type
+            old_dist = torch.distributions.Categorical(logits=mb_old_shaped)
+            mb_old_lp_shaped = old_dist.log_prob(mb_actions)
+
             # PPO clipped surrogate
-            ratio = (new_log_probs - mb_old_lp).exp()
+            ratio = (new_log_probs - mb_old_lp_shaped).exp()
             surr1 = ratio * mb_adv
             surr2 = ratio.clamp(1 - clip_eps, 1 + clip_eps) * mb_adv
             policy_loss = -torch.min(surr1, surr2).mean()
@@ -322,7 +352,7 @@ def ppo_update(
             # Audit metrics
             with torch.no_grad():
                 clip_frac = ((ratio - 1.0).abs() > clip_eps).float().mean().item()
-                approx_kl = (mb_old_lp - new_log_probs).mean().item()
+                approx_kl = (mb_old_lp_shaped - new_log_probs).mean().item()  # fix1: use shaped ref
 
             metrics["policy_loss"] += policy_loss.item()
             metrics["value_loss"]  += value_loss.item()
@@ -374,10 +404,14 @@ def evaluate_isr(
                 prev_locs = positions.clone()
 
             phi_costs, _ = phi_adapter(feat, positions, prev_locs, agent_ids)
+            # FIX 2: normalize phi penalty by logit scale (consistent with collect_rollout)
+            raw_agent_logits_for_scale = logits[0, :, positions[:, 0], positions[:, 1]].T  # [N, 5]
+            logit_scale = raw_agent_logits_for_scale.std().clamp(min=0.1).item()
+            effective_alpha = phi_alpha / logit_scale
             shaped = apply_cost_shaping(
                 logits, phi_costs.to(device), feat,
                 positions.to(device), agent_ids.to(device),
-                alpha=phi_alpha, proximity_radius=phi_proximity_radius,
+                alpha=effective_alpha, proximity_radius=phi_proximity_radius,
             )
 
             agent_logits = shaped[0, :, positions[:, 0], positions[:, 1]].T  # [N, 5]
@@ -554,6 +588,7 @@ def main():
         writer.add_scalar("Train/entropy",      metrics["entropy"],      iteration)
         writer.add_scalar("Train/mean_reward",  mean_reward,             iteration)
         writer.add_scalar("Train/iter_time_s",  elapsed,                 iteration)
+        writer.add_scalar("Audit/logit_scale",  rollout["audit"]["phi"].get("mean_logit_scale", 1.0), iteration)  # fix2
 
         print(f"[{iteration:4d}/{max_iter}] "
               f"rew={mean_reward:.3f}  "
