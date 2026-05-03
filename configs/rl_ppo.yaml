@@ -1,4 +1,4 @@
-# CRAFT PPO hyperparameters
+# SEAM PPO hyperparameters
 # Usage: python train_rl.py --config configs/rl_ppo.yaml
 
 # ── Model ───────────────────────────────────────────────────────────────────

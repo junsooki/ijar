@@ -1,4 +1,4 @@
-# CRAFT — Cooperative Reward-shaping And Fine-Tuning
+# SEAM — Social-cost Enhancement for Agent Movement
 #
 # PyTorch is installed via conda (see README).
 # RAILGUN is NOT a pip package — clone it separately:

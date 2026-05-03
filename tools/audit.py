@@ -1,4 +1,4 @@
-"""Training audit logger for CRAFT.
+"""Training audit logger for SEAM."""
 
 Captures per-iteration stats that are useful for tuning the phi equations:
   - Phi signal breakdown (density / bottleneck / conflict contributions)

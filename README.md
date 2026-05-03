@@ -1,8 +1,8 @@
-# CRAFT — Cooperative Reward-shaping And Fine-Tuning
+# SEAM — Social-cost Enhancement for Agent Movement
 
-CRAFT fine-tunes a pre-trained [RAILGUN](https://github.com/airi-institute/rail-gun) UNet for **multi-agent path finding (MAPF)** using PPO reinforcement learning with heuristic cooperative cost shaping.
+SEAM fine-tunes a pre-trained [RAILGUN](https://github.com/airi-institute/rail-gun) UNet for **multi-agent path finding (MAPF)** using PPO reinforcement learning with heuristic cooperative cost shaping.
 
-The core hypothesis: RAILGUN's frozen UNet fails to cooperate when agents are densely packed. CRAFT diagnoses those failures and corrects them with shaped reward signals — without retraining the backbone.
+The core hypothesis: RAILGUN's frozen UNet fails to cooperate when agents are densely packed. SEAM diagnoses those failures and corrects them with shaped reward signals — without retraining the backbone.
 
 ---
 
@@ -45,34 +45,34 @@ Three signals are summed per agent to produce a cooperation cost:
 | Signal | Description | Default weight |
 |--------|-------------|----------------|
 | **Local density** | Number of other agents within L-inf radius 3 | `w_density = 2.0` |
-| **Betweenness centrality** | Pre-cached graph centrality score of the cell (bottleneck detection) | `w_bottleneck = 3.0` |
-| **Directional conflict** | Whether another agent's heading points at this agent's next cell | `w_conflict = 5.0` |
+| **Betweenness centrality** | Normalized graph centrality of the cell — higher at bottlenecks | `w_bottleneck = 3.0` |
+| **Directional conflict** | Soft dot-product alignment of j's heading toward i, weighted by proximity | `w_conflict = 5.0` |
 
-Cost shaping subtracts a proximity-weighted penalty from the UNet logits before sampling:
+Cost shaping subtracts a proximity-weighted, logit-scale-normalized penalty from UNet logits before sampling:
 
 ```
-shaped_logit[a, action] -= alpha * sum_over_neighbors(
-    max(0, (radius + 1 - dist) / (radius + 1)) * cost[neighbor]
-)
+effective_alpha = phi_alpha / std(UNet logits at agent positions)
+
+shaped_logit[i, a] -= effective_alpha * Σⱼ  max(0, (R+1 - dist) / (R+1)) * φⱼ
 ```
 
-This provides dense gradient signal even when agents are not occupying the same cell.
+Both the victim (agent being headed toward) and the aggressor (agent doing the heading) receive the conflict penalty.
 
 ### 4. PPO Training Loop (`train_rl.py`)
 
 ```
 for iteration in range(max_iterations):
     1. Collect rollout (T steps × N agents)
-       - Forward UNet → shape with phi costs → sample actions
-       - Store (obs, action, log_prob, reward, value, done)
+       - Forward UNet → normalize alpha by logit scale → shape with phi costs
+       - Store (obs, action, shaped_logits, shaping_delta, reward, value, done)
 
     2. Compute GAE (γ=0.99, λ=0.95)
        - Normalize advantages
 
     3. PPO update (multiple epochs over minibatches)
-       - Clipped surrogate policy loss (ε=0.2)
-       - Value loss (MSE)
-       - Entropy bonus (coef=0.01)
+       - new_log_prob: raw UNet logits + stored shaping_delta (same distribution as rollout)
+       - old_log_prob: recomputed from stored shaped_agent_logits
+       - Clipped surrogate loss (ε=0.2), value loss (MSE), entropy bonus (0.01)
        - Gradient clip (max_norm=0.5)
 
     4. Evaluate ISR every eval_interval
@@ -96,19 +96,20 @@ Three stages, each gated by Individual Success Rate (ISR):
 ## Project Structure
 
 ```
-craft/
+seam/
 ├── train_rl.py                  # Main PPO training script
 ├── configs/
 │   └── rl_ppo.yaml              # All hyperparameters
 ├── envs/
 │   └── pogema_railgun_env.py    # POGEMA → RAILGUN feature adapter
 ├── tools/
-│   └── heuristic_cost.py        # Cooperative cost shaping
+│   ├── heuristic_cost.py        # Cooperative cost shaping (phi)
+│   └── audit.py                 # Training audit logger
 ├── docs/
-│   └── explain_phi_gnn.py       # Educational PDF generator
+│   ├── seam_explained.py        # ELI4 PDF generator
+│   └── seam_explained.pdf       # Pre-built explainer PDF
 ├── diagnostic.ipynb             # Colab diagnostic notebook
 ├── diagnostic_local.ipynb       # Local diagnostic notebook
-├── colab_diagnostic_plan.md     # Phase 1 analysis plan
 ├── requirements.txt
 └── results/                     # Generated reports
 ```
@@ -117,7 +118,7 @@ craft/
 
 ## Diagnostic Analysis
 
-Before algorithm work, CRAFT runs a structured diagnostic to **prove** the cooperation failure hypothesis:
+SEAM includes a structured diagnostic to confirm the cooperation failure hypothesis:
 
 1. **Data collection** — generate maps, run RAILGUN inference, log per-cell records (action distribution, disagreement vs LaCAM expert, local density, betweenness)
 2. **Correlation analysis** — does disagreement rate increase with agent density?
@@ -125,7 +126,7 @@ Before algorithm work, CRAFT runs a structured diagnostic to **prove** the coope
 4. **AUC test** — can density alone predict disagreement?
 5. **Spatial heatmaps** — do failures cluster at bottlenecks?
 
-See `diagnostic.ipynb` / `colab_diagnostic_plan.md` for details.
+Requires RAILGUN installed + a pretrained checkpoint. See `diagnostic.ipynb` for details.
 
 ---
 
@@ -142,7 +143,7 @@ The training script auto-detects MPS (Metal) → falls back to CPU. With 32 GB u
 | Stage 3 — 16 agents, 32×32 | ⚠️ slow but possible | expect 0.5–1 it/s |
 | Full curriculum to convergence | ❌ not practical | needs GPU cluster |
 
-Good for: smoke-testing the pipeline, debugging env logic, verifying reward signal, short ablations (a few hundred iterations). Not good for: training to full ISR convergence (that wants a CUDA GPU for hours/days).
+Good for: smoke-testing the pipeline, debugging env logic, verifying reward signal, short ablations. Not good for: training to full ISR convergence (needs a CUDA GPU for hours/days).
 
 ---
 
@@ -151,8 +152,8 @@ Good for: smoke-testing the pipeline, debugging env logic, verifying reward sign
 ### 1. Create Conda Environment
 
 ```bash
-conda create -n craft python=3.11 -y
-conda activate craft
+conda create -n seam python=3.11 -y
+conda activate seam
 ```
 
 ### 2. Install PyTorch (Apple Silicon / MPS)

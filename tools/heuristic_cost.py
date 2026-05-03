@@ -1,4 +1,4 @@
-"""Heuristic cooperative cost function for CRAFT.
+"""Heuristic cooperative cost function for SEAM.
 
 Replaces the phi-GNN with three hand-engineered signals:
   1. Local density    — agents within L-inf radius 3 of each agent

@@ -1,14 +1,13 @@
-"""CRAFT — PPO fine-tuning of the pretrained RAILGUN UNet.
+"""SEAM — Social-cost Enhancement for Agent Movement.
+
+PPO fine-tuning of the pretrained RAILGUN UNet with heuristic cooperative
+cost shaping (density + betweenness + directional conflict).
 
 Usage:
     python train_rl.py --config configs/rl_ppo.yaml
     python train_rl.py --unet_checkpoint results/checkpoints/railgun_pretrained.pt \\
                        --map_source RAILGUN/data/map_files/maze-32-32-10-4-75 \\
                        --num_agents 4
-
-The UNet is fine-tuned with PPO in POGEMA.  A heuristic cost function
-(density + betweenness + directional conflict) shapes logits at each step,
-acting as a soft social-law during training.
 
 Architecture:
   - Policy: UNet [6,H,W] → shaped logits [5,H,W] → per-agent action
