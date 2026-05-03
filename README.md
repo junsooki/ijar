@@ -129,17 +129,82 @@ See `diagnostic.ipynb` / `colab_diagnostic_plan.md` for details.
 
 ---
 
+## Running on Mac (Apple Silicon)
+
+**Short answer: yes, test runs work fine on an M4 Mac mini.**
+
+The training script auto-detects MPS (Metal) → falls back to CPU. With 32 GB unified memory and an M4 chip:
+
+| Setting | Mac mini M4 (32 GB) | Notes |
+|---------|-------------------|-------|
+| Stage 1 — 4 agents, 16×16 | ✅ runs well | ~2–5 it/s on MPS |
+| Stage 2 — 8 agents, 16×16 | ✅ runs fine | slightly slower |
+| Stage 3 — 16 agents, 32×32 | ⚠️ slow but possible | expect 0.5–1 it/s |
+| Full curriculum to convergence | ❌ not practical | needs GPU cluster |
+
+Good for: smoke-testing the pipeline, debugging env logic, verifying reward signal, short ablations (a few hundred iterations). Not good for: training to full ISR convergence (that wants a CUDA GPU for hours/days).
+
+---
+
 ## Setup
 
-```bash
-# Install dependencies
-pip install -r requirements.txt
+### 1. Create Conda Environment
 
-# RAILGUN must be installed separately (provides UNet, cost shaping, feature builder)
-# See: https://github.com/airi-institute/rail-gun
+```bash
+conda create -n craft python=3.11 -y
+conda activate craft
 ```
 
+### 2. Install PyTorch (Apple Silicon / MPS)
+
+```bash
+# Apple Silicon Mac — installs PyTorch with MPS support
+conda install pytorch torchvision -c pytorch -y
+```
+
+> On Linux with CUDA, replace with:
+> `conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia -y`
+
+### 3. Install Remaining Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Install RAILGUN
+
+RAILGUN is not on PyPI — clone and install it manually:
+
+```bash
+git clone <railgun_repo_url> RAILGUN
+cd RAILGUN && pip install -e . && cd ..
+```
+
+### 5. Verify Setup
+
+```bash
+python - <<'EOF'
+import torch, pogema, networkx, yaml
+print("torch:", torch.__version__)
+print("MPS available:", torch.backends.mps.is_available())
+print("pogema:", pogema.__version__)
+print("All good!")
+EOF
+```
+
+---
+
 ## Training
+
+### Quick test run on Mac (no RAILGUN checkpoint needed)
+
+```bash
+python train_rl.py --config configs/rl_ppo.yaml
+```
+
+This uses a randomly initialized UNet — enough to verify the pipeline runs end-to-end. You should see rollout collection, PPO updates, and ISR logged to console.
+
+### Full training with pretrained UNet
 
 ```bash
 python train_rl.py --config configs/rl_ppo.yaml --unet_checkpoint path/to/railgun.pt
@@ -148,7 +213,7 @@ python train_rl.py --config configs/rl_ppo.yaml --unet_checkpoint path/to/railgu
 Key config options (`configs/rl_ppo.yaml`):
 
 ```yaml
-unet_checkpoint: null          # Path to pretrained RAILGUN UNet
+unet_checkpoint: null          # Path to pretrained RAILGUN UNet (null = random init)
 num_agents: 4                  # Starting curriculum stage
 learning_rate: 3.0e-5
 phi_w_density: 2.0             # Density cost weight
@@ -157,6 +222,10 @@ phi_w_conflict: 5.0            # Directional conflict cost weight
 ```
 
 TensorBoard logs are written to `runs/` and checkpoints to `checkpoints/`.
+
+```bash
+tensorboard --logdir runs/
+```
 
 ---
 

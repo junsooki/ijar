@@ -1,5 +1,6 @@
 # CRAFT — Cooperative Reward-shaping And Fine-Tuning
 #
+# PyTorch is installed via conda (see README).
 # RAILGUN is NOT a pip package — clone it separately:
 #   git clone <railgun_repo_url> RAILGUN
 #   cd RAILGUN && pip install -e .
@@ -7,24 +8,27 @@
 # MAPF environment
 pogema>=1.4.0
 
-# Deep learning
-torch>=2.0
-torchvision
-
 # RL training
 pyyaml                 # config loading in train_rl.py
 tensorboard            # TensorBoard logging
+tensorboardX           # alternative TB writer, useful in notebooks
 
 # Analysis / heuristics
 numpy
 networkx               # betweenness centrality for heuristic cost
-scikit-learn
+scikit-learn           # logistic regression, AUC for diagnostics
+scipy                  # graph / stats utilities
 
 # Data
 pandas
-pyarrow
+pyarrow                # parquet I/O for diagnostic logs
+
+# Visualization / notebooks
+matplotlib
+seaborn
+ipykernel              # run notebooks in conda env
+ipywidgets             # progress bars in Jupyter
 
 # Misc
 tqdm
-matplotlib
-seaborn
+gymnasium>=0.26        # pogema depends on this
