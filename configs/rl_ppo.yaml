@@ -7,7 +7,7 @@ feature_dim: 6
 action_dim: 5
 first_layer_channels: 64
 blocks_per_stage: 0            # DoubleConv (matches pretrained checkpoint)
-bilinear: true
+bilinear: false
 
 # ── Environment ─────────────────────────────────────────────────────────────
 map_source: null               # path to .map dir or file; null = random POGEMA maps
@@ -40,6 +40,10 @@ phi_proximity_radius: 2
 phi_w_density: 2.0
 phi_w_bottleneck: 3.0
 phi_w_conflict: 5.0
+
+# ── Fine-tuning ──────────────────────────────────────────────────────────
+freeze_backbone: true
+trainable_layers: [up4, output_conv]   # last decoder block + output head
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 log_dir: runs

@@ -41,6 +41,11 @@ figures/
 *.png
 *.pdf
 
+# Training run outputs and local-only files
+runs/
+results/
+diagnostic_local.ipynb
+
 # OS / editor
 .DS_Store
 Thumbs.db

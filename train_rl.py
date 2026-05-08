@@ -31,8 +31,12 @@ import torch.nn.functional as F
 import yaml
 from torch.utils.tensorboard import SummaryWriter
 
-# RAILGUN imports (assumes RAILGUN/ is on sys.path or installed)
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "RAILGUN"))
+# seam/ must be first so our tools/ package takes precedence over RAILGUN/tools/
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+sys.path.append(os.path.join(_HERE, "RAILGUN"))  # RAILGUN at end for models/
+
 from models.unet import UNet
 
 # CRAFT imports
@@ -40,9 +44,35 @@ from envs.pogema_railgun_env import POGEMARailgunEnv
 from tools.heuristic_cost import HeuristicPhiAdapter, precompute_betweenness
 from tools.audit import AuditLogger, collect_phi_stats, collect_action_stats
 
-# RAILGUN cost shaping (from RAILGUN/tools/)
 from tools.cost_shaping import apply_cost_shaping
 from tools.graph_construction import extract_agent_positions
+
+# RAILGUN action deltas: 0=stay, 1=right, 2=left, 3=up, 4=down
+_ACTION_DELTAS = [(0, 0), (0, 1), (0, -1), (-1, 0), (1, 0)]
+
+
+def compute_action_mask(feat: torch.Tensor, positions: torch.Tensor,
+                         agent_ids: torch.Tensor, N: int) -> torch.Tensor:
+    """[N, 5] bool mask: True=valid. Stays always valid; movements invalid if
+    target cell is an obstacle or off-grid. Invisible agents → all-stay mask."""
+    H, W = feat.shape[-2:]
+    obstacle = feat[0]  # [H, W], 1=wall
+    mask = torch.zeros(N, 5, dtype=torch.bool)
+    mask[:, 0] = True  # stay always valid
+    if positions.shape[0] == 0:
+        return mask
+    for k in range(positions.shape[0]):
+        r = int(positions[k, 0].item())
+        c = int(positions[k, 1].item())
+        a_idx = int(agent_ids[k].item()) - 1
+        if not (0 <= a_idx < N):
+            continue
+        for a in range(1, 5):
+            dr, dc = _ACTION_DELTAS[a]
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < H and 0 <= nc < W and obstacle[nr, nc].item() < 0.5:
+                mask[a_idx, a] = True
+    return mask
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -82,6 +112,9 @@ def collect_rollout(
     rollout_steps: int,
     phi_alpha: float,
     phi_proximity_radius: int,
+    reward_scale: float = 1.0,
+    cfg_action_masking: bool = False,
+    policy_aware_phi: bool = False,
 ) -> dict:
     """Collect a rollout of `rollout_steps` environment steps.
 
@@ -123,9 +156,9 @@ def collect_rollout(
             # UNet forward
             logits, _ = unet(feat_dev)  # [1, 5, H, W]
 
-            # Heuristic cost shaping
+            # Extract visible agent positions (may be < N if some agents finished)
             positions, agent_ids = extract_agent_positions(feat)
-            if prev_locs is None:
+            if prev_locs is None or prev_locs.shape[0] != positions.shape[0]:
                 prev_locs = positions.clone()
 
             phi_costs, phi_components = phi_adapter(feat, positions, prev_locs, agent_ids)
@@ -134,32 +167,49 @@ def collect_rollout(
             agent_ids_dev = agent_ids.to(device)
 
             # FIX 2: normalize phi penalty by logit scale
-            raw_agent_logits_for_scale = logits[0, :, positions[:, 0], positions[:, 1]].T  # [N, 5]
-            logit_scale = raw_agent_logits_for_scale.std().clamp(min=0.1).item()
+            if positions.shape[0] > 0:
+                raw_agent_logits_for_scale = logits[0, :, positions[:, 0], positions[:, 1]].T
+                logit_scale = raw_agent_logits_for_scale.std().clamp(min=0.1).item()
+            else:
+                logit_scale = 1.0
             effective_alpha = phi_alpha / logit_scale
 
             shaped = apply_cost_shaping(
                 logits, phi_costs_dev, feat, positions_dev, agent_ids_dev,
                 alpha=effective_alpha, proximity_radius=phi_proximity_radius,
+                policy_aware=policy_aware_phi,
             )  # [1, 5, H, W]
 
-            # Per-agent action sampling
-            agent_logits = shaped[0, :, positions[:, 0], positions[:, 1]].T  # [N, 5]
+            # Build full [N, 5] logit matrices — stay (uniform) for invisible agents
+            full_shaped_logits = torch.zeros(N, 5, device=device)
+            full_raw_logits    = torch.zeros(N, 5, device=device)
+            vis_idx = (agent_ids - 1).long()  # 0-indexed agent slots for visible agents
+            if positions.shape[0] > 0:
+                vis_shaped = shaped[0, :, positions[:, 0], positions[:, 1]].T   # [k, 5]
+                vis_raw    = logits[0, :, positions[:, 0], positions[:, 1]].T   # [k, 5]
+                for k_i, a_i in enumerate(vis_idx.clamp(0, N-1).tolist()):
+                    full_shaped_logits[a_i] = vis_shaped[k_i]
+                    full_raw_logits[a_i]    = vis_raw[k_i]
 
-            # FIX 1: compute and store shaped logits and shaping delta for PPO reference
-            raw_agent_logits = logits[0, :, positions[:, 0], positions[:, 1]].T  # [N, 5]
-            shaping_delta = agent_logits - raw_agent_logits  # [N, 5] — the phi correction
-            shaped_logits_list.append(agent_logits.cpu())    # [N, 5]
-            shaping_delta_list.append(shaping_delta.cpu())   # [N, 5]
-            logit_scales_list.append(logit_scale)            # scalar
-            dist = torch.distributions.Categorical(logits=agent_logits)
-            actions = dist.sample()         # [N]
+            # ACTION MASKING (optional): zero out probability for moves into obstacles
+            if cfg_action_masking:
+                action_mask = compute_action_mask(feat, positions, agent_ids, N).to(device)
+                full_shaped_logits = full_shaped_logits.masked_fill(~action_mask, -1e8)
+
+            # FIX 1: compute and store shaped logits and shaping delta
+            shaping_delta = full_shaped_logits - full_raw_logits         # [N, 5]
+            shaped_logits_list.append(full_shaped_logits.cpu())
+            shaping_delta_list.append(shaping_delta.cpu())
+            logit_scales_list.append(logit_scale)
+
+            dist = torch.distributions.Categorical(logits=full_shaped_logits)
+            actions   = dist.sample()        # [N]
             log_probs = dist.log_prob(actions)  # [N]
 
             # State value (shared)
-            value = value_head(logits)      # [1] → scalar
+            value = value_head(logits)       # [1] → scalar
 
-            # Step environment
+            # Step environment — always pass N actions
             prev_locs = positions.clone()
             feat_next, rewards, done, _ = env.step(actions.cpu().numpy())
 
@@ -167,7 +217,7 @@ def collect_rollout(
             states_list.append(feat.cpu())
             actions_list.append(actions.cpu())
             log_probs_list.append(log_probs.cpu())
-            rewards_list.append(torch.from_numpy(rewards))
+            rewards_list.append(torch.from_numpy(rewards) * reward_scale)
             values_list.append(value.cpu().squeeze(0))
             dones_list.append(torch.tensor(done, dtype=torch.bool))
             phi_costs_list.append(phi_costs.cpu())
@@ -230,6 +280,35 @@ def compute_gae(
     return advantages, returns
 
 
+class RunningStat:
+    """Welford-style running mean/std with EMA decay.
+
+    Used to normalize returns across rollouts so the value head sees a stable
+    target distribution (per-batch normalization makes the target shift every
+    update, preventing learning).
+    """
+    def __init__(self, decay: float = 0.99):
+        self.decay = decay
+        self.mean = 0.0
+        self.var = 1.0
+        self.initialized = False
+
+    def update(self, x: torch.Tensor) -> None:
+        batch_mean = x.mean().item()
+        batch_var = x.var(unbiased=False).item()
+        if not self.initialized:
+            self.mean = batch_mean
+            self.var = batch_var
+            self.initialized = True
+        else:
+            self.mean = self.decay * self.mean + (1 - self.decay) * batch_mean
+            self.var = self.decay * self.var + (1 - self.decay) * batch_var
+
+    @property
+    def std(self) -> float:
+        return float(self.var) ** 0.5
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # PPO update
 # ──────────────────────────────────────────────────────────────────────────────
@@ -250,6 +329,7 @@ def ppo_update(
     phi_proximity_radius: int,
     gamma: float,
     gae_lambda: float,
+    return_stats: "RunningStat | None" = None,
 ) -> dict:
     """Run PPO update on collected rollout. Returns dict of loss metrics."""
     T, N = rollout["actions"].shape
@@ -266,6 +346,15 @@ def ppo_update(
         gamma, gae_lambda, last_val,
     )
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    # Two return-normalization strategies:
+    # - return_stats provided: running EMA stats (more principled but unstable in practice)
+    # - return_stats is the string "perbatch": v2-style per-batch normalization (stable
+    #   but locks v_loss at 1.0 since targets shift every update)
+    if return_stats == "perbatch":
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+    elif return_stats is not None:
+        return_stats.update(returns)
+        returns = (returns - return_stats.mean) / (return_stats.std + 1e-8)
 
     # Flatten: treat each (step, agent) as an independent sample
     flat_states         = rollout["states"].unsqueeze(1).expand(-1, N, -1, -1, -1).reshape(T * N, *rollout["states"].shape[1:])
@@ -280,7 +369,13 @@ def ppo_update(
     # Also store positions per step — needed for cost shaping during update
     # We re-extract positions from states on-the-fly (cheaper than storing them)
 
-    unet.train(); value_head.train()
+    unet.train()
+    # Freeze BatchNorm running stats — standard practice for fine-tuning pretrained models.
+    # Keeps weights trainable but prevents stats from drifting on small batches.
+    for m in unet.modules():
+        if isinstance(m, torch.nn.BatchNorm2d):
+            m.eval()
+    value_head.train()
 
     total_samples = T * N
     indices = torch.randperm(total_samples)
@@ -344,8 +439,8 @@ def ppo_update(
 
             optimizer.zero_grad()
             loss.backward()
-            params = list(unet.parameters()) + list(value_head.parameters())
-            grad_norm = nn.utils.clip_grad_norm_(params, max_norm=0.5).item()
+            trainable_params = [p for p in unet.parameters() if p.requires_grad] + list(value_head.parameters())
+            grad_norm = nn.utils.clip_grad_norm_(trainable_params, max_norm=0.5).item()
             optimizer.step()
 
             # Audit metrics
@@ -381,6 +476,7 @@ def evaluate_isr(
     n_episodes: int,
     phi_alpha: float,
     phi_proximity_radius: int,
+    policy_aware_phi: bool = False,
 ) -> float:
     """Individual Success Rate: fraction of agents reaching their goal."""
     unet.eval(); value_head.eval()
@@ -399,8 +495,16 @@ def evaluate_isr(
             logits, _ = unet(feat_dev)
 
             positions, agent_ids = extract_agent_positions(feat)
-            if prev_locs is None:
+            if prev_locs is None or prev_locs.shape[0] != positions.shape[0]:
                 prev_locs = positions.clone()
+
+            # If all agents have reached their goals, just step with stay actions
+            if positions.shape[0] == 0:
+                feat, rews, done, info = env.step(np.zeros(env.num_agents, dtype=np.int64))
+                reached |= (rews >= 9.0)
+                if done:
+                    break
+                continue
 
             phi_costs, _ = phi_adapter(feat, positions, prev_locs, agent_ids)
             # FIX 2: normalize phi penalty by logit scale (consistent with collect_rollout)
@@ -411,16 +515,25 @@ def evaluate_isr(
                 logits, phi_costs.to(device), feat,
                 positions.to(device), agent_ids.to(device),
                 alpha=effective_alpha, proximity_radius=phi_proximity_radius,
+                policy_aware=policy_aware_phi,
             )
 
-            agent_logits = shaped[0, :, positions[:, 0], positions[:, 1]].T  # [N, 5]
-            actions = agent_logits.argmax(dim=-1)  # greedy for eval
+            agent_logits = shaped[0, :, positions[:, 0], positions[:, 1]].T  # [k, 5]
+            actions_vis = agent_logits.argmax(dim=-1)  # greedy for eval, [k]
+
+            # POGEMA requires len(action)==num_agents always. Map visible-agent
+            # actions back to the full N slots; default to stay (0) for agents
+            # that have already reached their goal (no longer in feat ch1).
+            full_actions = np.zeros(env.num_agents, dtype=np.int64)
+            vis_idx = (agent_ids - 1).long().clamp(0, env.num_agents - 1)
+            for k_i, a_i in enumerate(vis_idx.tolist()):
+                full_actions[a_i] = int(actions_vis[k_i].item())
 
             prev_locs = positions.clone()
-            feat, rews, done, _ = env.step(actions.cpu().numpy())
+            feat, rews, done, info = env.step(full_actions)
 
-            # Check who reached goal (+10 reward = goal reached)
-            reached |= (rews >= 9.9)
+            # Use reward threshold to detect goal-reach (reward = -0.1 + 10.0 = 9.9)
+            reached |= (rews >= 9.0)
             if done:
                 break
 
@@ -521,15 +634,44 @@ def main():
         blocks_per_stage=cfg.get("blocks_per_stage", 0),
     ).to(device)
 
+    def _load_checkpoint(path):
+        """Load checkpoint, handling both plain UNet dicts and full SEAM checkpoints."""
+        try:
+            return torch.load(path, map_location=device, weights_only=True)
+        except Exception:
+            return torch.load(path, map_location=device, weights_only=False)
+
     ckpt_path = cfg.get("unet_checkpoint")
     if ckpt_path and os.path.isfile(ckpt_path):
-        state = torch.load(ckpt_path, map_location=device, weights_only=True)
-        unet.load_state_dict(state, strict=False)
-        print(f"Loaded UNet from {ckpt_path}")
+        state = _load_checkpoint(ckpt_path)
+        if "unet" in state:
+            unet.load_state_dict(state["unet"], strict=False)
+            print(f"Loaded UNet from SEAM checkpoint {ckpt_path}")
+        else:
+            unet.load_state_dict(state, strict=False)
+            print(f"Loaded UNet from {ckpt_path}")
     else:
         print("WARNING: No UNet checkpoint — training from random init.")
 
+    # Freeze most of the UNet; only fine-tune the last decoder block + output head.
+    # This gives enough capacity to learn cooperative behavior without catastrophic
+    # gradient explosion through 31M params.
+    freeze_backbone = cfg.get("freeze_backbone", True)
+    if freeze_backbone:
+        # Keep up4 (last decoder block) and output_conv trainable; freeze everything else
+        trainable_layers = cfg.get("trainable_layers", ["up4", "output_conv"])
+        for name, param in unet.named_parameters():
+            if not any(tl in name for tl in trainable_layers):
+                param.requires_grad_(False)
+        n_trainable = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+        print(f"Backbone partially frozen. Trainable UNet params: {n_trainable:,} ({', '.join(trainable_layers)})")
+
     value_head = ValueHead(action_dim=cfg.get("action_dim", 5)).to(device)
+    if ckpt_path and os.path.isfile(ckpt_path) and cfg.get("load_value_head", False):
+        state_vh = _load_checkpoint(ckpt_path)
+        if "value_head" in state_vh:
+            value_head.load_state_dict(state_vh["value_head"])
+            print(f"Loaded value head from SEAM checkpoint")
 
     # ── Heuristic phi adapter ─────────────────────────────────────────────
     # Initialise with a dummy map; update_map() is called at each episode reset
@@ -539,13 +681,12 @@ def main():
         w_density=cfg.get("phi_w_density", 2.0),
         w_bottleneck=cfg.get("phi_w_bottleneck", 3.0),
         w_conflict=cfg.get("phi_w_conflict", 5.0),
+        density_kernel=cfg.get("density_kernel", "harmonic"),
     )
 
     # ── Optimizer ────────────────────────────────────────────────────────────
-    optimizer = torch.optim.Adam(
-        list(unet.parameters()) + list(value_head.parameters()),
-        lr=cfg.get("learning_rate", 3e-5),
-    )
+    trainable = [p for p in unet.parameters() if p.requires_grad] + list(value_head.parameters())
+    optimizer = torch.optim.Adam(trainable, lr=cfg.get("learning_rate", 3e-5))
 
     # ── Training loop ────────────────────────────────────────────────────────
     max_iter  = cfg.get("max_iterations", 2000)
@@ -556,27 +697,52 @@ def main():
     phi_alpha = cfg.get("phi_alpha", 1.0)
     phi_prox  = cfg.get("phi_proximity_radius", 2)
 
+    # Return normalization strategy:
+    # - "perbatch" (v2-style): stable, but value head can't learn variance patterns
+    # - "running" (EMA): value head learns, but high PPO clip rates from drift
+    # - None (raw): only works if reward_scale keeps returns bounded
+    norm_mode = cfg.get("return_norm", None)  # "perbatch" | "running" | None
+    if norm_mode == "running":
+        return_stats = RunningStat(decay=0.99)
+    elif norm_mode == "perbatch":
+        return_stats = "perbatch"
+    else:
+        return_stats = None
+
+    # Entropy schedule: linear decay from entropy_coef_start to entropy_coef_end over decay_iters
+    ent_start = cfg.get("entropy_coef", 0.01)
+    ent_end   = cfg.get("entropy_coef_end", ent_start)
+    ent_decay_iters = cfg.get("entropy_decay_iters", max_iter)
+
     for iteration in range(1, max_iter + 1):
         t0 = time.time()
+
+        # Linear entropy decay
+        frac = min(1.0, (iteration - 1) / max(ent_decay_iters, 1))
+        entropy_coef_now = ent_start + (ent_end - ent_start) * frac
 
         # Collect rollout
         rollout = collect_rollout(
             env, unet, value_head, phi_adapter, device,
             rollout_steps=cfg.get("rollout_steps", 512),
             phi_alpha=phi_alpha, phi_proximity_radius=phi_prox,
+            reward_scale=cfg.get("reward_scale", 1.0),
+            cfg_action_masking=cfg.get("action_masking", False),
+            policy_aware_phi=cfg.get("policy_aware_phi", False),
         )
 
         # PPO update
         metrics = ppo_update(
             unet, value_head, phi_adapter, optimizer, rollout, device,
             clip_eps=cfg.get("clip_eps", 0.2),
-            entropy_coef=cfg.get("entropy_coef", 0.01),
+            entropy_coef=entropy_coef_now,
             value_coef=cfg.get("value_coef", 0.5),
             ppo_epochs=cfg.get("ppo_epochs", 4),
             minibatch_size=cfg.get("minibatch_size", 256),
             phi_alpha=phi_alpha, phi_proximity_radius=phi_prox,
             gamma=cfg.get("gamma", 0.99),
             gae_lambda=cfg.get("gae_lambda", 0.95),
+            return_stats=return_stats,
         )
 
         elapsed = time.time() - t0
@@ -588,6 +754,10 @@ def main():
         writer.add_scalar("Train/mean_reward",  mean_reward,             iteration)
         writer.add_scalar("Train/iter_time_s",  elapsed,                 iteration)
         writer.add_scalar("Audit/logit_scale",  rollout["audit"]["phi"].get("mean_logit_scale", 1.0), iteration)  # fix2
+        writer.add_scalar("Train/entropy_coef", entropy_coef_now, iteration)
+        if isinstance(return_stats, RunningStat):
+            writer.add_scalar("Train/return_mean", return_stats.mean, iteration)
+            writer.add_scalar("Train/return_std",  return_stats.std,  iteration)
 
         print(f"[{iteration:4d}/{max_iter}] "
               f"rew={mean_reward:.3f}  "
@@ -596,7 +766,8 @@ def main():
               f"ent={metrics['entropy']:.4f}  "
               f"({elapsed:.1f}s)")
 
-        auditor.record(iteration, rollout["audit"], metrics)
+        auditor.record(iteration, rollout["audit"], metrics,
+                       mean_reward=mean_reward)
 
         # ── Evaluation ───────────────────────────────────────────────────────
         if iteration % eval_int == 0:
@@ -604,17 +775,21 @@ def main():
                 eval_env, unet, value_head, phi_adapter, device,
                 n_episodes=cfg.get("eval_episodes", 20),
                 phi_alpha=phi_alpha, phi_proximity_radius=phi_prox,
+                policy_aware_phi=cfg.get("policy_aware_phi", False),
             )
             writer.add_scalar("Eval/ISR", isr, iteration)
             print(f"  → ISR = {isr:.3f}  (best = {best_isr:.3f})")
+            # Also append a small ISR-only audit entry so plot_curves.py can
+            # read isr per checkpoint without parsing stdout.
+            auditor._log_jsonl(iteration, {}, {}, extra={"isr": float(isr)})
 
             if isr > best_isr:
                 best_isr = isr
                 torch.save({
                     "unet": unet.state_dict(),
                     "value_head": value_head.state_dict(),
-                    "iteration": iteration,
-                    "isr": isr,
+                    "iteration": int(iteration),
+                    "isr": float(isr),
                 }, os.path.join(log_dir, "best.pt"))
 
             # ── Curriculum advancement ─────────────────────────────────────
@@ -633,14 +808,14 @@ def main():
             torch.save({
                 "unet": unet.state_dict(),
                 "value_head": value_head.state_dict(),
-                "iteration": iteration,
+                "iteration": int(iteration),
             }, os.path.join(log_dir, f"ckpt_{iteration:05d}.pt"))
 
     # Final checkpoint
     torch.save({
         "unet": unet.state_dict(),
         "value_head": value_head.state_dict(),
-        "iteration": max_iter,
+        "iteration": int(max_iter),
     }, os.path.join(log_dir, "final.pt"))
     print(f"\nTraining complete. Best ISR: {best_isr:.3f}")
     auditor.close()

@@ -1,0 +1,80 @@
+# SEAM mass-training config for GPU.
+# Empirically derived from 18 controlled M4-MPS experiments (May 2026).
+# Best small-scale config: v15 — harmonic kernel.
+# Validated by 100-episode tight eval on ckpt_00200 (final-iter policies):
+#   v15 harmonic   ckpt200: ISR = 0.105 (winner)
+#   v16 no-phi     ckpt200: ISR = 0.103
+#   v17 calibrated ckpt200: ISR = 0.060 (regressed in late training!)
+#
+# Note on methodology: training-time best.pt is saved on noisy 30-eval peaks and
+# is NOT representative. Always re-evaluate final iteration with 100+ episodes.
+#
+# Key choices and why (see docs/seam_formula.pdf for full derivation):
+#   - density_kernel: harmonic    → empirically best at end-of-training
+#   - return_norm: perbatch       → per-batch zero-mean, only stable choice in tests
+#   - entropy_coef: 0.10 fixed    → decay always degraded ISR in our setting
+#   - ppo_epochs: 4               → ppo_epochs=2 caused directional collapse
+#   - phi_w_density: 2.0          → halving (v18) hurt more than helped
+#   - freeze_backbone: true; up4+output_conv only — 144k trainable params
+#   - per-batch return norm only works if v_loss is allowed to lock at 1.0; trade
+#     diagnosability for stability (see PDF §6.3)
+
+unet_checkpoint: results/checkpoints/railgun_pretrained.pt
+feature_dim: 6
+action_dim: 5
+first_layer_channels: 64
+blocks_per_stage: 0
+bilinear: false
+freeze_backbone: true
+trainable_layers: [up4, output_conv]
+
+# ── Curriculum: scale up gradually on GPU ────────────────────────────────────
+# Starts where M4 testing ended (4 agents 16x16) then ramps to research-scale.
+num_agents: 4
+map_size: 16
+map_density: 0.3
+max_steps_per_episode: 128
+
+curriculum:
+  - {num_agents: 4,  map_size: 16, max_steps: 128, isr_threshold: 0.15}
+  - {num_agents: 8,  map_size: 16, max_steps: 192, isr_threshold: 0.15}
+  - {num_agents: 8,  map_size: 32, max_steps: 256, isr_threshold: 0.20}
+  - {num_agents: 16, map_size: 32, max_steps: 256, isr_threshold: 0.20}
+  - {num_agents: 16, map_size: 64, max_steps: 384, isr_threshold: null}
+
+# ── PPO ──────────────────────────────────────────────────────────────────────
+learning_rate: 1.0e-5
+clip_eps: 0.2
+entropy_coef: 0.10        # fixed; decay degrades ISR
+entropy_coef_end: 0.10
+entropy_decay_iters: 1
+value_coef: 0.5
+gae_lambda: 0.95
+gamma: 0.99
+ppo_epochs: 4
+minibatch_size: 256       # bigger on GPU than the M4's 128
+
+return_norm: perbatch     # the only stable choice we tested
+action_masking: false     # tested in v13, hurt more than helped
+
+# ── Rollout ──────────────────────────────────────────────────────────────────
+rollout_steps: 1024       # 4× the M4 setting; GPU can chew through it
+max_iterations: 2000
+eval_interval: 50
+eval_episodes: 100        # 3× M4 setting — tighter ISR variance bounds
+save_interval: 100
+
+# ── Phi (heuristic cost) — THE WINNING FORMULA ───────────────────────────────
+# PHI SHAPING DISABLED — empirically harmful at every scale tested.
+# At 8 agents 16x16, no-phi (v21) achieved ISR 0.114 vs harmonic phi (v20) at 0.054.
+# To re-enable for further experiments, set phi_alpha: 1.0 below.
+phi_alpha: 0.0              # was 1.0; disabled per dense ablation
+phi_proximity_radius: 2
+phi_w_density: 2.0
+phi_w_bottleneck: 3.0
+phi_w_conflict: 5.0
+density_kernel: harmonic    # ignored when phi_alpha=0
+
+log_dir: runs
+run_name: gpu_mass_v1
+audit_interval: 25

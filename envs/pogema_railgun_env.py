@@ -47,6 +47,34 @@ _DEFAULT_MAP_DIR = os.path.join(
 NOT_FOUND_DIST = 2048
 
 
+def _trinary_gradient(delta_a: float, delta_b: float) -> int:
+    """Mirrors RAILGUN's C++ feature builder branching for the gradient channels.
+
+    Inputs are signed deltas (neighbour_distance - current_distance) for the two
+    candidate moves along an axis. Returns -1, 0, or +1 with random tie-breaking
+    matching the C++ logic. The exact semantic mapping of {-1, 0, +1} to spatial
+    directions depends on which two deltas are passed and is what the pretrained
+    model learned during training.
+
+    See RAILGUN/tools/extensions/construct_features_native.cpp lines 270-306.
+    """
+    if delta_a > 0 and delta_b > 0:
+        return 0
+    if delta_a >= 0 and delta_b < 0:
+        return 1
+    if delta_a < 0 and delta_b >= 0:
+        return -1
+    if delta_a < 0 and delta_b < 0:
+        return random.choice((-1, 1))
+    if delta_a == 0 and delta_b == 0:
+        return random.choice((-1, 0, 1))
+    if delta_a == 0 and delta_b > 0:
+        return random.choice((-1, 0))
+    if delta_a > 0 and delta_b == 0:
+        return random.choice((0, 1))
+    return random.choice((-1, 1))
+
+
 def load_map_file(path: str) -> np.ndarray:
     """Parse a MovingAI .map file and return a binary obstacle array.
 
@@ -220,11 +248,12 @@ class POGEMARailgunEnv:
         self._update_goals_and_dists()
 
         curr_dists = self._agent_distances()
-        inner = self._env.unwrapped
-        reached = np.array(inner.grid.on_goal, dtype=bool) if hasattr(inner.grid, "on_goal") else np.zeros(self.num_agents, dtype=bool)
+        # Use POGEMA's per-agent termination flag (True = agent reached goal this step)
+        reached = np.array(terms[:self.num_agents], dtype=bool)
 
         rewards = self._compute_rewards(prev_dists, curr_dists, reached)
-        done = all(terms) or all(truncs)
+        # Episode ends when all agents finish (terms) or time limit hit (any truncs)
+        done = all(terms) or any(truncs)
         feat = self._build_feature()
         return feat, rewards, done, {}
 
@@ -308,7 +337,16 @@ class POGEMARailgunEnv:
         return dists
 
     def _build_feature(self) -> torch.Tensor:
-        """Construct [6, H, W] RAILGUN feature tensor from current POGEMA state."""
+        """Construct [6, H, W] feature tensor matching RAILGUN's training spec.
+
+        Mirrors RAILGUN/tools/extensions/construct_features_native.cpp exactly:
+          - Channel 3 is the raw BFS distance (NOT normalised). 2048 = unreachable.
+          - Channels 4, 5 are discrete trinary {-1, 0, +1} gradient signals
+            indicating whether moving (row-1, row+1) and (col-1, col+1) reduces
+            the goal distance, with random tie-breaking for ambiguous cases.
+          - Valid-neighbour check excludes both obstacles AND cells occupied by
+            other agents (matches RAILGUN's agent_plane[idx] == 0 condition).
+        """
         H, W = self._obstacle.shape
         feat = torch.zeros(6, H, W, dtype=torch.float32)
 
@@ -316,45 +354,52 @@ class POGEMARailgunEnv:
         feat[0] = torch.from_numpy(self._obstacle.astype(np.float32))
 
         positions = self._agent_positions()
-        normaliser = float(H + W)
 
+        # Channels 1, 2 first so the trinary gradient logic can read them
+        # to exclude cells occupied by other agents.
         for i, (r, c) in enumerate(positions):
-            agent_id = float(i + 1)
             r_c = max(0, min(r, H - 1))
             c_c = max(0, min(c, W - 1))
-
-            # Channel 1: agent position
-            feat[1, r_c, c_c] = agent_id
-
-            # Channel 2: goal position
+            feat[1, r_c, c_c] = float(i + 1)
             gr, gc_ = self._goal_positions[i]
             gr = max(0, min(gr, H - 1))
             gc_ = max(0, min(gc_, W - 1))
-            feat[2, gr, gc_] = agent_id
+            feat[2, gr, gc_] = float(i + 1)
 
-            # Channel 3: BFS distance to goal (normalised)
+        # Channels 3, 4, 5: distance + trinary gradient
+        for i, (r, c) in enumerate(positions):
+            r_c = max(0, min(r, H - 1))
+            c_c = max(0, min(c, W - 1))
+
             dm = self._dist_maps[i]
-            d = float(dm[r_c, c_c])
-            feat[3, r_c, c_c] = d / normaliser if d < NOT_FOUND_DIST else 0.0
+            d_self = float(dm[r_c, c_c])
+            # Channel 3: raw distance (not normalised — matches RAILGUN training)
+            feat[3, r_c, c_c] = d_self if d_self < NOT_FOUND_DIST else float(NOT_FOUND_DIST)
 
-            # Channels 4-5: finite-difference gradient of distance map
-            # gradient_x (row direction): d[r-1,c] - d[r+1,c] / 2
-            # gradient_y (col direction): d[r,c-1] - d[r,c+1] / 2
-            d_up   = float(dm[max(r_c - 1, 0), c_c])
-            d_down = float(dm[min(r_c + 1, H - 1), c_c])
-            d_left = float(dm[r_c, max(c_c - 1, 0)])
-            d_right = float(dm[r_c, min(c_c + 1, W - 1)])
+            # Valid-neighbour check (obstacle-free AND not occupied by another agent)
+            def _valid(nr: int, nc: int) -> bool:
+                if not (0 <= nr < H and 0 <= nc < W):
+                    return False
+                if self._obstacle[nr, nc] != 0:
+                    return False
+                if feat[1, nr, nc].item() != 0:  # cell occupied by some agent
+                    return False
+                return True
 
-            # Treat unreachable cells as same distance (gradient = 0 toward them)
-            if d_up >= NOT_FOUND_DIST:    d_up = d
-            if d_down >= NOT_FOUND_DIST:  d_down = d
-            if d_left >= NOT_FOUND_DIST:  d_left = d
-            if d_right >= NOT_FOUND_DIST: d_right = d
+            # Match RAILGUN's variable names exactly:
+            #   "left"  = row-1   "right" = row+1   "up"    = col-1   "down"  = col+1
+            left_dist  = float(dm[r_c - 1, c_c]) if _valid(r_c - 1, c_c) else float(NOT_FOUND_DIST)
+            right_dist = float(dm[r_c + 1, c_c]) if _valid(r_c + 1, c_c) else float(NOT_FOUND_DIST)
+            up_dist    = float(dm[r_c, c_c - 1]) if _valid(r_c, c_c - 1) else float(NOT_FOUND_DIST)
+            down_dist  = float(dm[r_c, c_c + 1]) if _valid(r_c, c_c + 1) else float(NOT_FOUND_DIST)
 
-            gx = (d_up - d_down) / (2.0 * normaliser)
-            gy = (d_left - d_right) / (2.0 * normaliser)
-            feat[4, r_c, c_c] = gx
-            feat[5, r_c, c_c] = gy
+            delta_left  = left_dist  - d_self
+            delta_right = right_dist - d_self
+            delta_up    = up_dist    - d_self
+            delta_down  = down_dist  - d_self
+
+            feat[4, r_c, c_c] = float(_trinary_gradient(delta_left,  delta_right))
+            feat[5, r_c, c_c] = float(_trinary_gradient(delta_down,  delta_up))
 
         return feat
 

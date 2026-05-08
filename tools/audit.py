@@ -1,16 +1,9 @@
-"""Training audit logger for SEAM."""
+"""Training audit logger for SEAM.
 
-Captures per-iteration stats that are useful for tuning the phi equations:
+Captures per-iteration stats useful for tuning the phi equations:
   - Phi signal breakdown (density / bottleneck / conflict contributions)
   - PPO health (clip fraction, KL estimate, grad norm)
   - Action histogram and freeze rate
-  - Value calibration (predicted vs actual return)
-
-Usage in train_rl.py:
-    from tools.audit import AuditLogger
-    auditor = AuditLogger(log_dir, writer)
-    auditor.record(iteration, rollout_stats, ppo_metrics)
-    auditor.print_summary(iteration)   # every N iters
 """
 
 import json
@@ -32,10 +25,21 @@ class AuditLogger:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def record(self, iteration: int, rollout_stats: dict, ppo_metrics: dict):
-        """Write to TensorBoard and JSONL; print summary every print_interval iters."""
+    def record(self, iteration: int, rollout_stats: dict, ppo_metrics: dict,
+               mean_reward: float | None = None, isr: float | None = None):
+        """Write to TensorBoard and JSONL; print summary every print_interval iters.
+
+        mean_reward and isr are optional curve-tracking fields; if provided
+        they're written to the JSONL line so plot_curves.py can read them
+        without parsing stdout.
+        """
         self._log_tb(iteration, rollout_stats, ppo_metrics)
-        self._log_jsonl(iteration, rollout_stats, ppo_metrics)
+        extra = {}
+        if mean_reward is not None:
+            extra["mean_reward"] = float(mean_reward)
+        if isr is not None:
+            extra["isr"] = float(isr)
+        self._log_jsonl(iteration, rollout_stats, ppo_metrics, extra=extra)
         if iteration % self.print_interval == 0:
             self.print_summary(iteration, rollout_stats, ppo_metrics)
 
@@ -97,11 +101,14 @@ class AuditLogger:
 
     # ── JSONL ─────────────────────────────────────────────────────────────────
 
-    def _log_jsonl(self, iteration: int, rollout_stats: dict, ppo_metrics: dict):
+    def _log_jsonl(self, iteration: int, rollout_stats: dict, ppo_metrics: dict,
+                   extra: dict | None = None):
         record = {"iteration": iteration}
         record.update({f"phi_{k}": v for k, v in rollout_stats.get("phi", {}).items()})
         record.update({f"act_{k}": v for k, v in rollout_stats.get("actions", {}).items()})
         record.update({f"ppo_{k}": v for k, v in ppo_metrics.items()})
+        if extra:
+            record.update(extra)
         self._fh.write(json.dumps(record) + "\n")
         self._fh.flush()
 
@@ -148,7 +155,10 @@ def collect_action_stats(
     freeze_count = 0
     total = 0
     for t in range(1, len(positions_list)):
-        moved = (positions_list[t] - positions_list[t - 1]).abs().sum(dim=-1) == 0
+        p_cur, p_prev = positions_list[t], positions_list[t - 1]
+        if p_cur.shape[0] != p_prev.shape[0]:
+            continue  # skip when agent count changes (someone reached goal)
+        moved = (p_cur - p_prev).abs().sum(dim=-1) == 0
         freeze_count += moved.sum().item()
         total += moved.numel()
 

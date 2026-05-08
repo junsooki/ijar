@@ -1,8 +1,8 @@
 # SEAM — Social-cost Enhancement for Agent Movement
 
-SEAM fine-tunes a pre-trained [RAILGUN](https://github.com/airi-institute/rail-gun) UNet for **multi-agent path finding (MAPF)** using PPO reinforcement learning with heuristic cooperative cost shaping.
+SEAM fine-tunes a pre-trained [RAILGUN](https://github.com/airi-institute/rail-gun) UNet for **multi-agent path finding (MAPF)** using PPO reinforcement learning.
 
-The core hypothesis: RAILGUN's frozen UNet fails to cooperate when agents are densely packed. SEAM diagnoses those failures and corrects them with shaped reward signals — without retraining the backbone.
+> **Status (May 2026):** After 22 controlled experiments, the cooperative cost-shaping (phi) was empirically net-negative — phi-on lost to phi-off across all tested densities. The current recommendation for mass training is `phi_alpha: 0.0` (no shaping). The actual win was finding a **feature-format mismatch** between our env and RAILGUN's training distribution; once the env was corrected to produce raw-distance + trinary-gradient features, PPO no-phi reaches **ISR ≈ 0.78** at 200 iters on 4 agents/16×16 (vs the broken-feature baseline of ~0.10). See `configs/rl_ppo_gpu.yaml` for the recommended config.
 
 ---
 
@@ -29,9 +29,11 @@ Each timestep the environment produces a `[6, H, W]` tensor:
 | 0 | Obstacle map (1 = wall) |
 | 1 | Agent positions (value = agent ID) |
 | 2 | Goal positions (value = agent ID) |
-| 3 | BFS distance-to-goal, normalized by H+W |
-| 4 | Distance gradient X (row direction) |
-| 5 | Distance gradient Y (column direction) |
+| 3 | BFS distance-to-goal (raw integer hop count, 2048 = unreachable) |
+| 4 | Distance gradient (row axis), trinary {-1, 0, +1} |
+| 5 | Distance gradient (col axis), trinary {-1, 0, +1} |
+
+This spec mirrors RAILGUN's C++ feature builder (`RAILGUN/tools/extensions/construct_features_native.cpp`) exactly — the pretrained checkpoint was trained on this distribution, and any drift here breaks the model silently.
 
 ### 2. Model Architecture
 
@@ -226,6 +228,35 @@ TensorBoard logs are written to `runs/` and checkpoints to `checkpoints/`.
 
 ```bash
 tensorboard --logdir runs/
+```
+
+---
+
+## GPU Mass Training (Vessl AI / CUDA box)
+
+```bash
+# 1. Place the RAILGUN pretrained checkpoint at:
+#    results/checkpoints/railgun_pretrained.pt
+# 2. Clone RAILGUN repo into ./RAILGUN/ (gitignored upstream)
+# 3. Run:
+python3 train_rl.py --config configs/rl_ppo_gpu.yaml
+```
+
+The GPU config (`configs/rl_ppo_gpu.yaml`) inherits the recommendations from
+the empirical record: `phi_alpha: 0.0`, per-batch return normalisation,
+fixed entropy `0.10`, partial backbone freezing (up4 + output_conv only),
+curriculum from 4→16 agents on 16→64 maps.
+
+**After training, evaluate with:**
+
+```bash
+python3 tools/tight_eval.py --episodes 100 --seed 42
+python3 tools/tight_eval.py --episodes 100 --seed 1337
+# Edit the configs[] list inside tight_eval.py to point at the GPU run's
+# ckpt_*.pt files. ALWAYS use ≥100 episodes and ≥2 seeds —
+# 30-eval training-time peaks are noisy and produce misleading rankings.
+
+python3 tools/plot_curves.py --runs gpu_mass_v1 --out seam_curves.png
 ```
 
 ---

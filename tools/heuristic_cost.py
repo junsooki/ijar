@@ -102,6 +102,7 @@ def compute_heuristic_phi(
     w_density: float = W_DENSITY,
     w_bottleneck: float = W_BOTTLENECK,
     w_conflict: float = W_CONFLICT,
+    density_kernel: str = "harmonic",  # "harmonic" | "calibrated" | "binary"
 ) -> tuple[torch.Tensor, dict]:  # ([N] float32, component dict)
     """Compute per-agent heuristic cooperative cost.
 
@@ -122,12 +123,35 @@ def compute_heuristic_phi(
 
     pos_f = positions.float()
 
-    # ── 1. Local density ────────────────────────────────────────────────────
+    # ── 1. Local density (distance-decayed) ────────────────────────────────
+    # Three kernel choices, all preserve ordering by L-inf proximity:
+    #
+    # "binary"     : w(d) = 1 within radius (original v2 formula)
+    # "harmonic"   : w(d) = 1/(d+1)                — d=1:0.5, d=2:0.333, d=3:0.25
+    # "calibrated" : collision-probability-derived — d=1:1.0, d=2:0.5,   d=3:0
+    #
+    # Calibrated weights are derived from P(one-step collision | both agents
+    # take uniform random actions) for L-inf-adjacent pairs:
+    #   d=1: 2 shared reachable cells → P_coll = 2/25; normalised to 1.0
+    #   d=2: 1 shared midpoint cell   → P_coll = 1/25; normalised to 0.5
+    #   d=3: 0 shared cells           → P_coll = 0;    weight = 0
+    # Harmonic 1/(d+1) overweights distant neighbours vs the physics; calibrated
+    # corrects that.
     diff = pos_f.unsqueeze(0) - pos_f.unsqueeze(1)        # [N, N, 2]
     linf = diff.abs().max(dim=-1).values                    # [N, N]
+    linf_f = linf.float()
     self_mask = ~torch.eye(N, dtype=torch.bool, device=device)
     in_radius = (linf <= DENSITY_RADIUS) & self_mask
-    density_raw = in_radius.float().sum(dim=1)             # [N]
+    if density_kernel == "binary":
+        decay = torch.ones_like(linf_f)
+    elif density_kernel == "calibrated":
+        # Collision-probability-derived: 1.0 at d=1, 0.5 at d=2, 0 at d>=3
+        decay = torch.where(linf_f <= 1.0, torch.ones_like(linf_f),
+                torch.where(linf_f <= 2.0, torch.full_like(linf_f, 0.5),
+                            torch.zeros_like(linf_f)))
+    else:  # "harmonic" (default)
+        decay = 1.0 / (linf_f + 1.0)
+    density_raw = (decay * in_radius.float()).sum(dim=1)   # [N]
     density_cost = w_density * density_raw
 
     # ── 2. Bottleneck score ─────────────────────────────────────────────────
@@ -137,6 +161,9 @@ def compute_heuristic_phi(
     bottleneck_cost = w_bottleneck * bc
 
     # ── 3. Directional conflict ─────────────────────────────────────────────
+    # Reverted: the stationary-block addition caused directional collapse in v7-v10
+    # because it activated phi penalties for ALL nearby stationary pairs at once.
+    # Density already covers stationary proximity. Conflict stays movement-specific.
     heading = positions.float() - prev_positions.float()    # [N, 2]
     conflict_cost = torch.zeros(N, dtype=torch.float32, device=device)
 
@@ -150,12 +177,10 @@ def compute_heuristic_phi(
             dir_j_to_i = pos_f[i] - pos_f[j]                          # [2]
             dist_ji = dir_j_to_i.norm().clamp(min=1e-6)
             dir_j_to_i_unit = dir_j_to_i / dist_ji
-            # How directly is j heading toward i?
-            alignment = (heading_unit[j] * dir_j_to_i_unit).sum().clamp(0, 1)  # scalar
-            # Proximity weight — closer agents contribute more
+            alignment = (heading_unit[j] * dir_j_to_i_unit).sum().clamp(0, 1)
             proximity = (1.0 / (dist_ji + 1.0))
             conflict_cost[i] = conflict_cost[i] + w_conflict * alignment * proximity
-            conflict_cost[j] = conflict_cost[j] + w_conflict * alignment * proximity  # aggressor also penalized
+            conflict_cost[j] = conflict_cost[j] + w_conflict * alignment * proximity
 
     costs = (density_cost + bottleneck_cost + conflict_cost).clamp(max=MAX_COST)
     components = {
@@ -189,10 +214,12 @@ class HeuristicPhiAdapter:
         w_density: float = W_DENSITY,
         w_bottleneck: float = W_BOTTLENECK,
         w_conflict: float = W_CONFLICT,
+        density_kernel: str = "harmonic",
     ):
         self.w_density = w_density
         self.w_bottleneck = w_bottleneck
         self.w_conflict = w_conflict
+        self.density_kernel = density_kernel
         self._bc_grid: torch.Tensor = precompute_betweenness(obstacle)
 
     def update_map(self, obstacle: np.ndarray):
@@ -211,5 +238,6 @@ class HeuristicPhiAdapter:
             w_density=self.w_density,
             w_bottleneck=self.w_bottleneck,
             w_conflict=self.w_conflict,
+            density_kernel=self.density_kernel,
         )
         return costs, components
