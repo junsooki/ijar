@@ -1,0 +1,57 @@
+# VESSL sweep over multiple MAPF regimes for generalization study.
+# Trains separate refinement models per regime, then evaluates each.
+#
+# Run with:
+#   vessl sweep create -f vessl/regime_sweep.yaml
+
+name: seam-refinement-regime-sweep
+description: Train + eval refinement on 5 regimes (32ag/16x16 baseline + 4 variants)
+
+image: pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+
+resources:
+  cluster: vessl-gcp-oregon
+  preset: gpu-l4-small
+
+import:
+  /code/:
+    git:
+      url: https://github.com/junsooki/seam
+      ref: main
+
+# Each row in sweep.parameters runs as a separate experiment.
+sweep:
+  strategy: grid
+  parameters:
+    - name: REGIME
+      values:
+        - { name: "32ag_16x16_d030", num_agents: 32, map_size: 16, density: 0.30, dataset: "/data/lacam_hard_combined_v4.pt" }
+        - { name: "16ag_16x16_d030", num_agents: 16, map_size: 16, density: 0.30, dataset: "/data/regimes/lacam_16ag_16x16_d030.pt" }
+        - { name: "48ag_16x16_d030", num_agents: 48, map_size: 16, density: 0.30, dataset: "/data/regimes/lacam_48ag_16x16_d030.pt" }
+        - { name: "32ag_16x16_d040", num_agents: 32, map_size: 16, density: 0.40, dataset: "/data/regimes/lacam_32ag_d040.pt" }
+        - { name: "32ag_20x20_d030", num_agents: 32, map_size: 20, density: 0.30, dataset: "/data/regimes/lacam_32ag_20x20_d030.pt" }
+
+env:
+  PYTHONNOUSERSITE: "1"
+
+run:
+  - workdir: /code
+    command: |
+      set -e
+      apt-get update -qq && apt-get install -y -qq git build-essential
+      pip install --quiet --no-cache-dir numpy pyyaml tqdm pogema==1.4.0 pogema-toolbox tensorboard
+
+      python train_refinement.py \
+        --dataset ${REGIME_dataset} \
+        --epochs 50 --batch_size 64 \
+        --early_stop_patience 15 --val_frac 0.05 \
+        --seed 42 \
+        --run_name refinement_${REGIME_name} \
+        --save_dir /output/runs
+
+      CKPT=/output/runs/refinement_${REGIME_name}/best.pt
+      REFINEMENT_KMAX=2 PPO_BEST="$CKPT" python tools/diag_pogema_compare.py \
+        --episodes 200 --num_agents ${REGIME_num_agents} --map_size ${REGIME_map_size} \
+        --density ${REGIME_density} --max_steps 128 --seed 42 \
+        > /output/eval_${REGIME_name}.log 2>&1
+      cat /output/eval_${REGIME_name}.log | tail -10

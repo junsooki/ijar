@@ -1,274 +1,195 @@
-# SEAM — Social-cost Enhancement for Agent Movement
+# IJAR — Iterative Joint-Action Refinement for MAPF
 
-SEAM fine-tunes a pre-trained [RAILGUN](https://github.com/airi-institute/rail-gun) UNet for **multi-agent path finding (MAPF)** using PPO reinforcement learning.
+A lightweight neural method for **multi-agent pathfinding (MAPF)** that augments a centralized policy with explicit, iterative conflict-feedback refinement. Built on top of [RAILGUN](https://github.com/airi-institute/rail-gun) as the backbone.
 
-> **Status (May 2026):** After 22 controlled experiments, the cooperative cost-shaping (phi) was empirically net-negative — phi-on lost to phi-off across all tested densities. The current recommendation for mass training is `phi_alpha: 0.0` (no shaping). The actual win was finding a **feature-format mismatch** between our env and RAILGUN's training distribution; once the env was corrected to produce raw-distance + trinary-gradient features, PPO no-phi reaches **ISR ≈ 0.78** at 200 iters on 4 agents/16×16 (vs the broken-feature baseline of ~0.10). See `configs/rl_ppo_gpu.yaml` for the recommended config.
-
----
-
-## How It Works
-
-```
-Pretrained UNet (frozen, 7.8M params)
-       ↓
-  Raw logits [5, H, W]   ←── 6-channel feature map from environment
-       ↓
-Heuristic Phi Adapter    ←── density + bottleneck + conflict costs
-       ↓
-Shaped logits → action sampling
-       ↓
-PPO update on Value Head only (+ fine-tune policy logits)
-```
-
-### 1. Observation Representation
-
-Each timestep the environment produces a `[6, H, W]` tensor:
-
-| Channel | Content |
-|---------|---------|
-| 0 | Obstacle map (1 = wall) |
-| 1 | Agent positions (value = agent ID) |
-| 2 | Goal positions (value = agent ID) |
-| 3 | BFS distance-to-goal (raw integer hop count, 2048 = unreachable) |
-| 4 | Distance gradient (row axis), trinary {-1, 0, +1} |
-| 5 | Distance gradient (col axis), trinary {-1, 0, +1} |
-
-This spec mirrors RAILGUN's C++ feature builder (`RAILGUN/tools/extensions/construct_features_native.cpp`) exactly — the pretrained checkpoint was trained on this distribution, and any drift here breaks the model silently.
-
-### 2. Model Architecture
-
-- **UNet backbone** — frozen pre-trained RAILGUN weights; outputs `[5, H, W]` action logits over the entire grid
-- **Value Head** — `GlobalAvgPool(logits) → Linear(5, 64) → ReLU → Linear(64, 1)`; trained from scratch
-
-### 3. Heuristic Phi — Cooperative Cost (`tools/heuristic_cost.py`)
-
-Three signals are summed per agent to produce a cooperation cost:
-
-| Signal | Description | Default weight |
-|--------|-------------|----------------|
-| **Local density** | Number of other agents within L-inf radius 3 | `w_density = 2.0` |
-| **Betweenness centrality** | Normalized graph centrality of the cell — higher at bottlenecks | `w_bottleneck = 3.0` |
-| **Directional conflict** | Soft dot-product alignment of j's heading toward i, weighted by proximity | `w_conflict = 5.0` |
-
-Cost shaping subtracts a proximity-weighted, logit-scale-normalized penalty from UNet logits before sampling:
-
-```
-effective_alpha = phi_alpha / std(UNet logits at agent positions)
-
-shaped_logit[i, a] -= effective_alpha * Σⱼ  max(0, (R+1 - dist) / (R+1)) * φⱼ
-```
-
-Both the victim (agent being headed toward) and the aggressor (agent doing the heading) receive the conflict penalty.
-
-### 4. PPO Training Loop (`train_rl.py`)
-
-```
-for iteration in range(max_iterations):
-    1. Collect rollout (T steps × N agents)
-       - Forward UNet → normalize alpha by logit scale → shape with phi costs
-       - Store (obs, action, shaped_logits, shaping_delta, reward, value, done)
-
-    2. Compute GAE (γ=0.99, λ=0.95)
-       - Normalize advantages
-
-    3. PPO update (multiple epochs over minibatches)
-       - new_log_prob: raw UNet logits + stored shaping_delta (same distribution as rollout)
-       - old_log_prob: recomputed from stored shaped_agent_logits
-       - Clipped surrogate loss (ε=0.2), value loss (MSE), entropy bonus (0.01)
-       - Gradient clip (max_norm=0.5)
-
-    4. Evaluate ISR every eval_interval
-       - ISR = agents reaching goal / total agents
-       - Save checkpoint on improvement
-       - Advance curriculum if threshold met
-```
-
-### 5. Curriculum Learning
-
-Three stages, each gated by Individual Success Rate (ISR):
-
-| Stage | Agents | Map size | Max steps | ISR to advance |
-|-------|--------|----------|-----------|----------------|
-| 1 | 4 | 16×16 | 128 | 0.50 |
-| 2 | 8 | 16×16 | 192 | 0.50 |
-| 3 | 16 | 32×32 | 256 | — |
+> **Status (May 2026):** On the hard POGEMA dense regime (32 agents, 16×16, density 0.30), n=200 tight eval:
+>
+> | Method                          | ISR                |
+> |---------------------------------|--------------------|
+> | RAILGUN baseline                | 0.286              |
+> | Pure PIBT                       | 0.461              |
+> | **IJAR (17K LACAM samples)**    | **0.582 ± 0.009**  |
+>
+> Δ vs pure PIBT = +0.121 (z = +23.4). No test-time search; pure NN argmax with K=2 refinement passes.
 
 ---
 
-## Project Structure
+## What it is
+
+A centralized MAPF policy that, instead of producing actions in one forward pass, produces a **draft joint action**, computes a deterministic **conflict feature map** from that draft, and refines its output conditioned on the draft + conflict map. At inference, the loop runs up to K passes with early-stop on no-conflict.
+
+Mathematically:
 
 ```
-seam/
-├── train_rl.py                  # Main PPO training script
-├── configs/
-│   └── rl_ppo.yaml              # All hyperparameters
-├── envs/
-│   └── pogema_railgun_env.py    # POGEMA → RAILGUN feature adapter
+P^r = f_θ(X, A^(r-1), C^(r-1))    with    A^0 = 0, C^0 = 0
+```
+
+where `X` is the state, `A^(r-1)` is the previous-pass action proposal (5-channel one-hot at agent cells), `C^(r-1)` is the 11-channel conflict feature map computed from the proposal, and `P^r` is the refined logits.
+
+---
+
+## Architecture
+
+```
+              X [6, H, W]
+                  ↓
+         RAILGUN U-Net body (preserved, ~31M params)
+                  ↓ [64, H, W] penultimate
+                  ⊕  ← additive combine
+                  ↑
+   FeedbackEncoder (NEW, 16K params, zero-init final layer)
+                  ↑
+         (A^(r-1), C^(r-1)) concatenated [16, H, W]
+                  ↓
+        output_conv (RAILGUN's 1×1)
+                  ↓
+              P^r [5, H, W]
+                  ↓
+   argmax (with action mask) → A^r
+   compute_conflict_features(A^r) → C^r
+                  ↓
+    repeat until no conflict or K_max passes
+```
+
+**Conflict feature channels (deterministic, no learnable params):**
+
+| Channel | Description |
+|---|---|
+| 0–4 | Action one-hot at each agent's current cell |
+| 5   | Proposed next-cell occupancy count (normalized) |
+| 6   | Vertex-conflict indicator |
+| 7   | Edge-swap conflict indicator |
+| 8   | "Agent is in any conflict" indicator |
+| 9   | "Proposed target is an obstacle" indicator |
+| 10  | Reserved (entropy / confidence) |
+
+---
+
+## Repo layout
+
+```
+ijar/
+├── train_refinement.py             # SL training loop (two-pass loss + scheduled sampling)
 ├── tools/
-│   ├── heuristic_cost.py        # Cooperative cost shaping (phi)
-│   └── audit.py                 # Training audit logger
-├── docs/
-│   ├── seam_explained.py        # ELI4 PDF generator
-│   └── seam_explained.pdf       # Pre-built explainer PDF
-├── diagnostic.ipynb             # Colab diagnostic notebook
-├── diagnostic_local.ipynb       # Local diagnostic notebook
+│   ├── iterative_refinement.py     # IterativeRefinementPolicy + FeedbackEncoder
+│   ├── conflict_features.py        # deterministic 11-channel conflict map
+│   ├── gen_lacam_hard.py           # LACAM expert data generation
+│   ├── diag_pogema_compare.py      # tight n=200 evaluation
+│   ├── eval_lacam_matched_budget.py # LaCAM-at-matched-compute baseline
+│   ├── graph_construction.py       # agent position extraction
+│   └── tight_eval.py
+├── envs/
+│   └── pogema_railgun_env.py       # POGEMA → RAILGUN feature adapter
+├── vessl/                          # GPU run configs (multi-seed + multi-regime)
 ├── requirements.txt
-└── results/                     # Generated reports
+└── README.md
 ```
-
----
-
-## Diagnostic Analysis
-
-SEAM includes a structured diagnostic to confirm the cooperation failure hypothesis:
-
-1. **Data collection** — generate maps, run RAILGUN inference, log per-cell records (action distribution, disagreement vs LaCAM expert, local density, betweenness)
-2. **Correlation analysis** — does disagreement rate increase with agent density?
-3. **Criticality metrics** — betweenness centrality, path intersections, revisit count
-4. **AUC test** — can density alone predict disagreement?
-5. **Spatial heatmaps** — do failures cluster at bottlenecks?
-
-Requires RAILGUN installed + a pretrained checkpoint. See `diagnostic.ipynb` for details.
-
----
-
-## Running on Mac (Apple Silicon)
-
-**Short answer: yes, test runs work fine on an M4 Mac mini.**
-
-The training script auto-detects MPS (Metal) → falls back to CPU. With 32 GB unified memory and an M4 chip:
-
-| Setting | Mac mini M4 (32 GB) | Notes |
-|---------|-------------------|-------|
-| Stage 1 — 4 agents, 16×16 | ✅ runs well | ~2–5 it/s on MPS |
-| Stage 2 — 8 agents, 16×16 | ✅ runs fine | slightly slower |
-| Stage 3 — 16 agents, 32×32 | ⚠️ slow but possible | expect 0.5–1 it/s |
-| Full curriculum to convergence | ❌ not practical | needs GPU cluster |
-
-Good for: smoke-testing the pipeline, debugging env logic, verifying reward signal, short ablations. Not good for: training to full ISR convergence (needs a CUDA GPU for hours/days).
 
 ---
 
 ## Setup
 
-### 1. Create Conda Environment
-
 ```bash
-conda create -n seam python=3.11 -y
-conda activate seam
-```
+# 1. Conda env
+conda create -n ijar python=3.11 -y
+conda activate ijar
 
-### 2. Install PyTorch (Apple Silicon / MPS)
-
-```bash
-# Apple Silicon Mac — installs PyTorch with MPS support
+# 2. PyTorch (Apple Silicon — MPS)
 conda install pytorch torchvision -c pytorch -y
-```
+#    On Linux + CUDA:
+# conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia -y
 
-> On Linux with CUDA, replace with:
-> `conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia -y`
-
-### 3. Install Remaining Dependencies
-
-```bash
+# 3. Other deps
 pip install -r requirements.txt
-```
 
-### 4. Install RAILGUN
-
-RAILGUN is not on PyPI — clone and install it manually:
-
-```bash
+# 4. RAILGUN (clone as sibling repo, then install)
 git clone <railgun_repo_url> RAILGUN
 cd RAILGUN && pip install -e . && cd ..
+
+# 5. Place the pretrained RAILGUN checkpoint at:
+#    results/checkpoints/railgun_pretrained.pt
 ```
 
-### 5. Verify Setup
+---
+
+## Data generation
+
+The training dataset is built by running LACAM on randomly-sampled hard-regime POGEMA maps and saving each `(state, expert_action)` tuple from solved trajectories.
 
 ```bash
-python - <<'EOF'
-import torch, pogema, networkx, yaml
-print("torch:", torch.__version__)
-print("MPS available:", torch.backends.mps.is_available())
-print("pogema:", pogema.__version__)
-print("All good!")
-EOF
+# Generate ~5K samples on the baseline hard regime
+python tools/gen_lacam_hard.py \
+  --num_maps 1000 --seed 42 --time_limit_sec 5 \
+  --num_agents 32 --map_size 16 --density 0.30 \
+  --out data/lacam_hard.pt
+
+# Append additional samples for scaling experiments
+python tools/gen_lacam_hard.py \
+  --num_maps 1000 --seed 43 --time_limit_sec 5 \
+  --append_existing data/lacam_hard.pt \
+  --out data/lacam_hard_combined.pt
 ```
+
+LACAM solve rate on the hard regime is ~13% within a 5-second budget; each solved episode contributes ~40 (state, action) tuples.
 
 ---
 
 ## Training
 
-### Quick test run on Mac (no RAILGUN checkpoint needed)
-
 ```bash
-python train_rl.py --config configs/rl_ppo.yaml
+python train_refinement.py \
+  --dataset data/lacam_hard_combined.pt \
+  --unet_checkpoint results/checkpoints/railgun_pretrained.pt \
+  --epochs 30 --batch_size 16 \
+  --val_frac 0.05 --early_stop_patience 100 \
+  --seed 42 \
+  --run_name refinement_hard32
 ```
 
-This uses a randomly initialized UNet — enough to verify the pipeline runs end-to-end. You should see rollout collection, PPO updates, and ISR logged to console.
+Notable hyperparameters:
+- **Two-pass loss:** `L = 0.5·CE(P^1, A*) + 1.0·CE(P^2, A*)`
+- **Scheduled sampling for pass-2 input:** 70% model's own first-pass argmax / 20% noised expert (20% of agents corrupted) / 10% clean expert
+- **Optimizer:** AdamW, lr=1e-4, batch_size=16
 
-### Full training with pretrained UNet
-
-```bash
-python train_rl.py --config configs/rl_ppo.yaml --unet_checkpoint path/to/railgun.pt
-```
-
-Key config options (`configs/rl_ppo.yaml`):
-
-```yaml
-unet_checkpoint: null          # Path to pretrained RAILGUN UNet (null = random init)
-num_agents: 4                  # Starting curriculum stage
-learning_rate: 3.0e-5
-phi_w_density: 2.0             # Density cost weight
-phi_w_bottleneck: 3.0          # Bottleneck cost weight
-phi_w_conflict: 5.0            # Directional conflict cost weight
-```
-
-TensorBoard logs are written to `runs/` and checkpoints to `checkpoints/`.
-
-```bash
-tensorboard --logdir runs/
-```
+Each epoch on a Mac mini (MPS) with ~17K samples takes ~16 minutes. 30 epochs is ~8 hours.
 
 ---
 
-## GPU Mass Training (Vessl AI / CUDA box)
+## Evaluation
+
+Tight n=200 evaluation, K=2 refinement passes, action mask applied:
 
 ```bash
-# 1. Place the RAILGUN pretrained checkpoint at:
-#    results/checkpoints/railgun_pretrained.pt
-# 2. Clone RAILGUN repo into ./RAILGUN/ (gitignored upstream)
-# 3. Run:
-python3 train_rl.py --config configs/rl_ppo_gpu.yaml
+REFINEMENT_KMAX=2 PPO_BEST=runs/refinement_hard32/final.pt \
+  python tools/diag_pogema_compare.py \
+  --episodes 200 --num_agents 32 --map_size 16 --density 0.30 \
+  --max_steps 128 --seed 42
 ```
 
-The GPU config (`configs/rl_ppo_gpu.yaml`) inherits the recommendations from
-the empirical record: `phi_alpha: 0.0`, per-batch return normalisation,
-fixed entropy `0.10`, partial backbone freezing (up4 + output_conv only),
-curriculum from 4→16 agents on 16→64 maps.
-
-**After training, evaluate with:**
-
-```bash
-python3 tools/tight_eval.py --episodes 100 --seed 42
-python3 tools/tight_eval.py --episodes 100 --seed 1337
-# Edit the configs[] list inside tight_eval.py to point at the GPU run's
-# ckpt_*.pt files. ALWAYS use ≥100 episodes and ≥2 seeds —
-# 30-eval training-time peaks are noisy and produce misleading rankings.
-
-python3 tools/plot_curves.py --runs gpu_mass_v1 --out seam_curves.png
-```
+`PPO_BEST` is the env-var override for the checkpoint path. `REFINEMENT_KMAX` controls how many refinement passes per env step (default 3).
 
 ---
 
-## Action Space
+## GPU / VESSL
 
-RAILGUN canonical indices (mapped to POGEMA):
+For multi-seed and multi-regime sweeps, GPU is ~8× faster than MPS. Configs:
 
-| Index | Action | Delta |
-|-------|--------|-------|
-| 0 | Stay | [0, 0] |
-| 1 | Right | [0, +1] |
-| 2 | Left | [0, -1] |
-| 3 | Up | [-1, 0] |
-| 4 | Down | [+1, 0] |
+- `vessl/train_refinement.yaml` — single-seed run
+- `vessl/multi_seed_sweep.yaml` — 3 seeds in parallel
+- `vessl/regime_sweep.yaml` — 5 regimes in parallel
+
+See `vessl/README.md` for prereqs (push repo to GitHub, upload dataset to VESSL volume, etc.).
+
+---
+
+## Action space
+
+RAILGUN action indices (mapped to POGEMA):
+
+| Index | Action | Δ(row, col) |
+|---|---|---|
+| 0 | Stay | (0, 0) |
+| 1 | Right | (0, +1) |
+| 2 | Left | (0, -1) |
+| 3 | Up | (-1, 0) |
+| 4 | Down | (+1, 0) |

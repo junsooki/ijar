@@ -156,15 +156,57 @@ class POGEMARailgunEnv:
         seed: Optional[int] = None,
         density: float = 0.3,
         size: int = 16,
+        feature_type: str = "none",
+        reward_mode: str = "dense_selfish",
     ):
+        if feature_type not in ("gradient", "none"):
+            raise ValueError(f"feature_type must be 'gradient' or 'none', got {feature_type!r}")
+        if reward_mode not in ("dense_selfish", "sparse", "cooperative", "cooperative_v2"):
+            raise ValueError(
+                f"reward_mode must be 'dense_selfish' | 'sparse' | 'cooperative' | 'cooperative_v2', "
+                f"got {reward_mode!r}"
+            )
         self.num_agents = num_agents
         self.max_steps = max_steps
         self.seed = seed
         self.density = density
         self.size = size
+        self.reward_mode = reward_mode
+        # Track prior-reached status across steps (for "first time reached" bonus
+        # in cooperative / cooperative_v2 modes). Reset in reset().
+        self._prev_reached: Optional[np.ndarray] = None
+        # 'none'     → channels 4/5 are signed (goal_row-agent_row, goal_col-agent_col)
+        #              displacement. This matches the upstream RAILGUN released
+        #              checkpoint's training distribution; default.
+        # 'gradient' → channels 4/5 are trinary {-1, 0, +1} (matches
+        #              construct_features_native.cpp). Use only when training
+        #              new models against that scheme.
+        self.feature_type = feature_type
 
         # Resolve map source
-        if isinstance(map_source, np.ndarray):
+        self._mix_sources = None  # set only when map_source is a curriculum mix
+        if isinstance(map_source, dict) and "mix" in map_source:
+            # Curriculum mix: list of {weight: float, source: str|None} entries.
+            # source = directory path → sample from map files; None/"random" → POGEMA random.
+            mix = []
+            for entry in map_source["mix"]:
+                weight = float(entry["weight"])
+                src = entry.get("source")
+                if src is None or src == "random":
+                    mix.append((weight, None))  # POGEMA random
+                elif isinstance(src, str) and os.path.isdir(src):
+                    files = collect_map_files(src)
+                    if not files:
+                        raise ValueError(f"No .map files in {src}")
+                    mix.append((weight, files))
+                elif isinstance(src, str) and os.path.isfile(src):
+                    mix.append((weight, [src]))
+                else:
+                    raise ValueError(f"Invalid mix source: {src}")
+            self._mix_sources = mix
+            self._map_files = None
+            self._fixed_map = None
+        elif isinstance(map_source, np.ndarray):
             self._map_files = None
             self._fixed_map = map_source
         elif isinstance(map_source, str):
@@ -214,6 +256,7 @@ class POGEMARailgunEnv:
 
         self._update_goals_and_dists()
         self._step_count = 0
+        self._prev_reached = np.zeros(self.num_agents, dtype=bool)
 
         feat = self._build_feature()
         return feat, {}
@@ -235,8 +278,9 @@ class POGEMARailgunEnv:
         """
         assert self._env is not None, "call reset() before step()"
 
-        # Record previous distances for reward computation
+        # Record previous state for reward computation
         prev_dists = self._agent_distances()
+        prev_positions = np.array(self._agent_positions(), dtype=np.int64)
 
         # Remap RAILGUN actions → POGEMA actions
         pogema_actions = [RAILGUN_TO_POGEMA[int(a)] for a in actions]
@@ -248,10 +292,17 @@ class POGEMARailgunEnv:
         self._update_goals_and_dists()
 
         curr_dists = self._agent_distances()
+        curr_positions = np.array(self._agent_positions(), dtype=np.int64)
         # Use POGEMA's per-agent termination flag (True = agent reached goal this step)
         reached = np.array(terms[:self.num_agents], dtype=bool)
 
-        rewards = self._compute_rewards(prev_dists, curr_dists, reached)
+        # Conflict detection: an agent is "conflicted" if it attempted a non-stay
+        # action but its position didn't change. (Wall block or PIBT-style revert.)
+        attempted_move = np.array([RAILGUN_TO_POGEMA[int(a)] != 0 for a in actions], dtype=bool)
+        stayed_in_place = np.all(curr_positions == prev_positions, axis=1)
+        conflicts = attempted_move & stayed_in_place & ~reached
+
+        rewards = self._compute_rewards(prev_dists, curr_dists, reached, conflicts, actions=actions)
         # Episode ends when all agents finish (terms) or time limit hit (any truncs)
         done = all(terms) or any(truncs)
         feat = self._build_feature()
@@ -273,6 +324,12 @@ class POGEMARailgunEnv:
     # ------------------------------------------------------------------
 
     def _sample_obstacle_map(self) -> Optional[np.ndarray]:
+        if self._mix_sources is not None:
+            weights = [w for w, _ in self._mix_sources]
+            files = random.choices(self._mix_sources, weights=weights, k=1)[0][1]
+            if files is None:
+                return None  # POGEMA random
+            return load_map_file(random.choice(files))
         if self._fixed_map is not None:
             return self._fixed_map
         if self._map_files is not None:
@@ -283,10 +340,15 @@ class POGEMARailgunEnv:
     def _make_grid_config(self, obstacle: Optional[np.ndarray], seed: int) -> GridConfig:
         if obstacle is not None:
             H, W = obstacle.shape
-            # Convert to list-of-strings format POGEMA expects
-            map_rows = ["".join("@" if obstacle[r, c] else "." for c in range(W)) for r in range(H)]
+            # POGEMA's str_map_to_list: '#' is obstacle, '.' is free, '@' is a
+            # "possible agent location" marker that resolves to FREE — using
+            # '@' here would silently make every wall walkable in the env.
+            map_str = "\n".join(
+                "".join("#" if obstacle[r, c] else "." for c in range(W))
+                for r in range(H)
+            )
             return GridConfig(
-                map=map_rows,
+                map=map_str,
                 num_agents=self.num_agents,
                 seed=seed,
                 max_episode_steps=self.max_steps,
@@ -337,15 +399,22 @@ class POGEMARailgunEnv:
         return dists
 
     def _build_feature(self) -> torch.Tensor:
-        """Construct [6, H, W] feature tensor matching RAILGUN's training spec.
+        """Construct [6, H, W] feature tensor for the RAILGUN UNet.
 
-        Mirrors RAILGUN/tools/extensions/construct_features_native.cpp exactly:
-          - Channel 3 is the raw BFS distance (NOT normalised). 2048 = unreachable.
-          - Channels 4, 5 are discrete trinary {-1, 0, +1} gradient signals
-            indicating whether moving (row-1, row+1) and (col-1, col+1) reduces
-            the goal distance, with random tie-breaking for ambiguous cases.
-          - Valid-neighbour check excludes both obstacles AND cells occupied by
-            other agents (matches RAILGUN's agent_plane[idx] == 0 condition).
+        Channels 0–3 are identical across both feature_type modes:
+          [0] obstacle                  (1=wall, 0=free)
+          [1] agent_id at agent cell    (1-based)
+          [2] agent_id at goal cell     (1-based)
+          [3] raw BFS distance from goal at the agent's cell  (2048 = unreachable)
+
+        Channels 4, 5 depend on self.feature_type:
+          'none'     → signed (goal_row - agent_row, goal_col - agent_col).
+                       This is what the upstream RAILGUN released checkpoint
+                       was trained on — empirically the only scheme under
+                       which it produces sensible argmax actions.
+          'gradient' → trinary {-1, 0, +1} from delta-distance comparisons,
+                       matching construct_features_native.cpp exactly. Use
+                       only when training new models against that scheme.
         """
         H, W = self._obstacle.shape
         feat = torch.zeros(6, H, W, dtype=torch.float32)
@@ -355,8 +424,7 @@ class POGEMARailgunEnv:
 
         positions = self._agent_positions()
 
-        # Channels 1, 2 first so the trinary gradient logic can read them
-        # to exclude cells occupied by other agents.
+        # Channels 1, 2 first so the gradient-mode validity check can read them.
         for i, (r, c) in enumerate(positions):
             r_c = max(0, min(r, H - 1))
             c_c = max(0, min(c, W - 1))
@@ -366,17 +434,22 @@ class POGEMARailgunEnv:
             gc_ = max(0, min(gc_, W - 1))
             feat[2, gr, gc_] = float(i + 1)
 
-        # Channels 3, 4, 5: distance + trinary gradient
+        # Channels 3, 4, 5
         for i, (r, c) in enumerate(positions):
             r_c = max(0, min(r, H - 1))
             c_c = max(0, min(c, W - 1))
 
             dm = self._dist_maps[i]
             d_self = float(dm[r_c, c_c])
-            # Channel 3: raw distance (not normalised — matches RAILGUN training)
             feat[3, r_c, c_c] = d_self if d_self < NOT_FOUND_DIST else float(NOT_FOUND_DIST)
 
-            # Valid-neighbour check (obstacle-free AND not occupied by another agent)
+            if self.feature_type == "none":
+                gr, gc_ = self._goal_positions[i]
+                feat[4, r_c, c_c] = float(gr - r_c)
+                feat[5, r_c, c_c] = float(gc_ - c_c)
+                continue
+
+            # feature_type == "gradient"
             def _valid(nr: int, nc: int) -> bool:
                 if not (0 <= nr < H and 0 <= nc < W):
                     return False
@@ -386,20 +459,13 @@ class POGEMARailgunEnv:
                     return False
                 return True
 
-            # Match RAILGUN's variable names exactly:
-            #   "left"  = row-1   "right" = row+1   "up"    = col-1   "down"  = col+1
             left_dist  = float(dm[r_c - 1, c_c]) if _valid(r_c - 1, c_c) else float(NOT_FOUND_DIST)
             right_dist = float(dm[r_c + 1, c_c]) if _valid(r_c + 1, c_c) else float(NOT_FOUND_DIST)
             up_dist    = float(dm[r_c, c_c - 1]) if _valid(r_c, c_c - 1) else float(NOT_FOUND_DIST)
             down_dist  = float(dm[r_c, c_c + 1]) if _valid(r_c, c_c + 1) else float(NOT_FOUND_DIST)
 
-            delta_left  = left_dist  - d_self
-            delta_right = right_dist - d_self
-            delta_up    = up_dist    - d_self
-            delta_down  = down_dist  - d_self
-
-            feat[4, r_c, c_c] = float(_trinary_gradient(delta_left,  delta_right))
-            feat[5, r_c, c_c] = float(_trinary_gradient(delta_down,  delta_up))
+            feat[4, r_c, c_c] = float(_trinary_gradient(left_dist - d_self, right_dist - d_self))
+            feat[5, r_c, c_c] = float(_trinary_gradient(down_dist - d_self, up_dist - d_self))
 
         return feat
 
@@ -408,14 +474,108 @@ class POGEMARailgunEnv:
         prev_dists: np.ndarray,
         curr_dists: np.ndarray,
         reached: np.ndarray,
+        conflicts: Optional[np.ndarray] = None,
+        actions: Optional[np.ndarray] = None,
     ) -> np.ndarray:
+        """Three reward modes selected by self.reward_mode:
+
+        'dense_selfish' (default, matches iter-7 winner reward on maze-34):
+            r = -0.1 + 10·reached + 0.5·improved_dist
+            Per-agent dense distance reward. Rewards selfish progress; no
+            explicit cooperative signal. Baseline.
+
+        'sparse' (PhD student's proposal):
+            r_i = 0.5 + 0.5·(remaining_time/limit)  if all agents reached
+                  0                                  otherwise
+            Episode-terminal binary. Cooperative by construction (all-or-nothing)
+            but compute-sparse; PPO struggles with the credit assignment at 32
+            agents.
+
+        'cooperative' (our design):
+            r_i = +0.02·(prev_dist_i - curr_dist_i)     # small dense progress
+                  - 0.1 ·conflicted_step_i                # conflict penalty (targets
+                                                          #   the selfish-argmax failure mode)
+                  + 0.3 ·just_reached_first_time_i        # per-agent first-reach bonus
+                  + (0.5 + 0.5·remaining/limit) [if all reached, applied to all agents]
+            Combines dense gradient with cooperative sparse terminal. Designed
+            to teach RAILGUN's per-cell argmax to avoid joint-action conflicts.
+
+        'cooperative_v2' (potential-based shaping, Ng et al. 1999):
+            Team-progress potential φ(s) = - (1/N) · Σ_i min(dist_i, MAX_DIST)
+            r_shape = φ(s') − φ(s)   (shared across all agents — policy-invariant)
+            r_i = r_shape
+                  + 0.3·just_reached_first_time_i       # per-agent reach bonus
+                  + (0.5 + 0.5·remaining/limit)·[all_solved]  # team terminal
+            Replaces the conflict penalty with a principled shaping signal that
+            naturally rewards cooperative behaviour: agents that yield to let
+            teammates progress get a positive shaped reward (team-distance dropped).
+            No "stay" pathology because there is no fixed per-step penalty.
         """
-        r = +10.0 * reached_goal
-            + 0.5  * (bfs_dist decreased)
-            - 0.1  (time penalty per step)
-        """
-        rewards = np.full(self.num_agents, -0.1, dtype=np.float32)
-        rewards += 10.0 * reached.astype(np.float32)
-        improved = (prev_dists - curr_dists > 0) & ~reached
-        rewards += 0.5 * improved.astype(np.float32)
+        N = self.num_agents
+        rewards = np.zeros(N, dtype=np.float32)
+
+        if self.reward_mode == "dense_selfish":
+            rewards.fill(-0.1)
+            rewards += 10.0 * reached.astype(np.float32)
+            improved = (prev_dists - curr_dists > 0) & ~reached
+            rewards += 0.5 * improved.astype(np.float32)
+            return rewards
+
+        if self.reward_mode == "sparse":
+            if bool(np.all(reached)):
+                time_remaining = max(0, self.max_steps - self._step_count)
+                bonus = 0.5 + 0.5 * (time_remaining / float(self.max_steps))
+                rewards.fill(np.float32(bonus))
+            return rewards
+
+        if self.reward_mode == "cooperative":
+            # Dense per-agent distance reduction (small).
+            delta = (prev_dists - curr_dists).astype(np.float32)
+            rewards += 0.02 * delta
+            # Conflict penalty: targets the selfish-argmax failure mode.
+            if conflicts is not None:
+                rewards -= 0.1 * conflicts.astype(np.float32)
+            # Per-agent first-time-reached bonus.
+            if self._prev_reached is None:
+                self._prev_reached = np.zeros(N, dtype=bool)
+            just_reached = reached & ~self._prev_reached
+            rewards += 0.3 * just_reached.astype(np.float32)
+            self._prev_reached = reached.copy()
+            # Cooperative terminal bonus.
+            if bool(np.all(reached)):
+                time_remaining = max(0, self.max_steps - self._step_count)
+                bonus = 0.5 + 0.5 * (time_remaining / float(self.max_steps))
+                rewards += np.float32(bonus)
+            return rewards
+
+        # cooperative_v2 — potential-based team-progress shaping +
+        # optional anti-stay bias (set SEAM_STAY_PENALTY env var, e.g. 0.02).
+        # Anti-stay subtracts per-agent penalty when agent chose action 0 (stay)
+        # while not at goal — counteracts the "stay is safe" equilibrium that
+        # PPO/MAPPO get stuck in (freeze >80% across 8 prior variants).
+        import os
+        _stay_penalty = float(os.environ.get("SEAM_STAY_PENALTY", "0.0"))
+        # Compute team potential at prev and curr states.
+        # Clip distances at NOT_FOUND_DIST to avoid astronomical magnitudes on
+        # unreachable cells (already cliped earlier by _agent_distances).
+        prev_clip = np.minimum(prev_dists.astype(np.float32), float(NOT_FOUND_DIST))
+        curr_clip = np.minimum(curr_dists.astype(np.float32), float(NOT_FOUND_DIST))
+        # φ(s) = − (1/N) · Σ dist; r_shape = φ(s') − φ(s) = (Σ prev − Σ curr) / N
+        r_shape = float((prev_clip - curr_clip).sum() / float(N))
+        rewards.fill(np.float32(r_shape))
+        # Per-agent first-time-reached bonus.
+        if self._prev_reached is None:
+            self._prev_reached = np.zeros(N, dtype=bool)
+        just_reached = reached & ~self._prev_reached
+        rewards += 0.3 * just_reached.astype(np.float32)
+        self._prev_reached = reached.copy()
+        # Cooperative terminal bonus.
+        if bool(np.all(reached)):
+            time_remaining = max(0, self.max_steps - self._step_count)
+            bonus = 0.5 + 0.5 * (time_remaining / float(self.max_steps))
+            rewards += np.float32(bonus)
+        # Anti-stay penalty
+        if _stay_penalty > 0 and actions is not None:
+            stay_mask = (np.asarray(actions, dtype=np.int64) == 0) & (~reached)
+            rewards -= np.float32(_stay_penalty) * stay_mask.astype(np.float32)
         return rewards

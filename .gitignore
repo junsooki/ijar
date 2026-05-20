@@ -1,9 +1,10 @@
-# Documentation / planning files (kept local only)
-*.md
-docs/
-
-# Upstream Railgun repo — installed separately, see requirements.txt
-RAILGUN/
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
 
 # Python
 __pycache__/
@@ -28,28 +29,38 @@ ENV/
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
-# Data / artifacts
-*.parquet
+# Upstream submodule (installed separately — see requirements.txt)
+RAILGUN/
+
+# Third-party reference code (clone separately if needed)
+external/
+
+# Data / models — too big for git
 *.pt
 *.pth
 *.ckpt
 *.npz
 *.pkl
-diagnostic_data/
-checkpoints/
-figures/
-*.png
-*.pdf
+*.parquet
+data/
 
-# Training run outputs and local-only files
+# Training outputs and intermediate checkpoints
 runs/
 results/
-diagnostic_local.ipynb
 
-# OS / editor
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
-*.swp
-*~
+# Drafts and notes (local only)
+paper/
+docs/
+*.pdf
+
+# Diagnostic outputs and figures
+diagnostic_data/
+figures/
+*.png
+
+# Archive (legacy attempts, kept local for reference)
+archive/
+
+# Editor / agent metadata
+.claude/
+CLAUDE.md

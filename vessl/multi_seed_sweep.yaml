@@ -1,0 +1,61 @@
+# VESSL hyperparameter sweep over training seeds.
+# Spawns 3 parallel runs with seeds 42, 43, 44.
+#
+# Run with:
+#   vessl sweep create -f vessl/multi_seed_sweep.yaml
+#
+# Each run writes its ckpt + n=200 eval to /output. Use the VESSL web UI
+# or `vessl experiment list` to see the per-seed ISR.
+
+name: seam-refinement-3seed-sweep
+description: 3-seed multi-run experiment for refinement architecture (AAAI variance bars)
+
+image: pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+
+resources:
+  cluster: vessl-gcp-oregon
+  preset: gpu-l4-small
+
+import:
+  /code/:
+    git:
+      url: https://github.com/junsooki/seam
+      ref: main
+
+# Sweep config: cross product of these vars defines individual runs.
+sweep:
+  strategy: grid
+  parameters:
+    - name: SEED
+      values: [42, 43, 44]
+
+env:
+  PYTHONNOUSERSITE: "1"
+
+run:
+  - workdir: /code
+    command: |
+      set -e
+      apt-get update -qq && apt-get install -y -qq git build-essential
+      pip install --quiet --no-cache-dir numpy pyyaml tqdm pogema==1.4.0 pogema-toolbox tensorboard
+
+      DATASET=/data/lacam_hard_combined_v4.pt
+      if [ ! -f "$DATASET" ]; then
+        echo "ERROR: $DATASET not found. Upload it to your VESSL volume first."
+        exit 1
+      fi
+
+      python train_refinement.py \
+        --dataset "$DATASET" \
+        --epochs 50 --batch_size 64 \
+        --early_stop_patience 15 --val_frac 0.05 \
+        --seed $SEED \
+        --run_name refinement_seed${SEED} \
+        --save_dir /output/runs
+
+      CKPT=/output/runs/refinement_seed${SEED}/best.pt
+      REFINEMENT_KMAX=2 PPO_BEST="$CKPT" python tools/diag_pogema_compare.py \
+        --episodes 200 --num_agents 32 --map_size 16 --density 0.30 \
+        --max_steps 128 --seed 42 \
+        > /output/eval_n200_seed${SEED}.log 2>&1
+      cat /output/eval_n200_seed${SEED}.log | tail -10

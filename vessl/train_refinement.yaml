@@ -1,0 +1,94 @@
+# VESSL run config for iterative-refinement SL training on a GPU.
+# Adjust resource spec / image / volume according to your VESSL workspace.
+#
+# Run with:
+#   vessl run -f vessl/train_refinement.yaml
+#
+# Outputs (ckpts, logs) are written to /output which VESSL persists
+# automatically per run.
+
+name: seam-refinement-train
+description: SL training of iterative joint-action refinement policy for MAPF
+
+# Image: any recent PyTorch CUDA image works. Adjust to your VESSL org's choice.
+image: pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+
+# GPU resource. Recommend at least 1× A100 or L40S. For our dataset size,
+# a single 24GB GPU is plenty.
+resources:
+  cluster: vessl-gcp-oregon         # change to your cluster
+  preset: gpu-l4-small              # 1× L4 24GB is enough; A100 makes things ~3× faster
+  # Examples of stronger presets if available in your VESSL org:
+  # preset: gpu-a100-1x
+  # preset: gpu-h100-1x
+
+# Source code. VESSL automatically mounts the git repo at /code.
+import:
+  /code/:
+    git:
+      url: https://github.com/junsooki/seam        # update with your repo URL
+      ref: main
+
+# Optional: mount LACAM dataset from VESSL storage. If you upload the
+# combined dataset to a VESSL volume, mount it here.
+#
+# volumes:
+#   - mount: /data
+#     read_only: true
+#     volume: seam-lacam-data
+
+# Environment variables seen by the training script.
+env:
+  PYTHONNOUSERSITE: "1"
+  PYTORCH_ENABLE_MPS_FALLBACK: "1"
+
+# Single-stage training run.
+run:
+  - workdir: /code
+    command: |
+      set -e
+      apt-get update -qq && apt-get install -y -qq git build-essential
+
+      # Install Python deps (only what's needed for refinement training; no
+      # PyTorch Geometric needed)
+      pip install --quiet --no-cache-dir \
+        numpy pyyaml tqdm matplotlib \
+        pogema==1.4.0 pogema-toolbox \
+        tensorboard
+
+      # If the LACAM dataset isn't mounted as a volume, generate it on-the-fly.
+      # This takes ~1.5 hr on CPU even with GPU available, so prefer to upload
+      # a pre-generated dataset to /data.
+      DATASET=/data/lacam_hard_combined_v4.pt
+      if [ ! -f "$DATASET" ]; then
+        echo "Dataset not found at $DATASET — generating from LACAM (slow)..."
+        mkdir -p /data
+        cd /code/RAILGUN/tools/build && cmake . && make -j4 lacam_online_native
+        cd /code
+        python tools/gen_lacam_hard.py \
+          --num_maps 5000 --seed 2000 --time_limit_sec 5 \
+          --num_agents 32 --map_size 16 --density 0.30 \
+          --out "$DATASET"
+      fi
+
+      # Train. Adjust epochs/batch_size for larger GPU.
+      python train_refinement.py \
+        --dataset "$DATASET" \
+        --unet_checkpoint /code/results/checkpoints/railgun_pretrained.pt \
+        --epochs 50 \
+        --batch_size 64 \
+        --early_stop_patience 15 \
+        --val_frac 0.05 \
+        --seed ${SEED:-42} \
+        --run_name refinement_gpu_seed${SEED:-42} \
+        --save_dir /output/runs
+
+      # Tight eval after training
+      CKPT=/output/runs/refinement_gpu_seed${SEED:-42}/best.pt
+      if [ -f "$CKPT" ]; then
+        REFINEMENT_KMAX=2 PPO_BEST="$CKPT" python tools/diag_pogema_compare.py \
+          --episodes 200 --num_agents 32 --map_size 16 --density 0.30 \
+          --max_steps 128 --seed 42 \
+          > /output/eval_n200.log 2>&1
+        cat /output/eval_n200.log | tail -10
+      fi

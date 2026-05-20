@@ -32,7 +32,8 @@ def load_checkpoint(path, device):
 
 
 def evaluate(ckpt_path, *, density_kernel, phi_alpha, n_episodes, num_agents=4,
-             map_size=16, max_steps=128, density=0.3, w_density=2.0, seed=42):
+             map_size=16, max_steps=128, density=0.3, w_density=2.0, seed=42,
+             feature_type="none"):
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
     unet = UNet(n_channels=6, n_classes=5, first_layer_channels=64,
@@ -48,7 +49,8 @@ def evaluate(ckpt_path, *, density_kernel, phi_alpha, n_episodes, num_agents=4,
     )
 
     env = POGEMARailgunEnv(num_agents=num_agents, max_steps=max_steps,
-                           density=density, size=map_size, seed=seed)
+                           density=density, size=map_size, seed=seed,
+                           feature_type=feature_type)
 
     successes = []  # per-agent reached fraction per episode
     for ep in range(n_episodes):
