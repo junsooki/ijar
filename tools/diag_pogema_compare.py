@@ -26,8 +26,16 @@ sys.path.append(os.path.join(_SEAM, "RAILGUN"))
 from models.unet import UNet
 from envs.pogema_railgun_env import POGEMARailgunEnv
 from tools.graph_construction import extract_agent_positions
-from tools.tight_eval import load_checkpoint
-from tools.diag_b_masked_eval import ACTION_DELTAS
+def load_checkpoint(path, device):
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except Exception:
+        return torch.load(path, map_location=device, weights_only=False)
+# RAILGUN canonical action deltas: 0=stay, 1=right, 2=left, 3=up, 4=down
+ACTION_DELTAS = torch.tensor(
+    [[0, 0], [0, 1], [0, -1], [-1, 0], [1, 0]],
+    dtype=torch.long,
+)
 
 
 def load_model_from_ckpt(ckpt_path, device):
